@@ -125,6 +125,12 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
+    pico_eef: str = "brainco"
+    """End-effector driver for hand open/close: 'none' or 'brainco'."""
+
+    pico_dds_interface: str = "enp4s0"
+    """Network interface for Brainco DDS (ignored when pico_eef=none)."""
+
     # Data exporter options
     task_prompt: str = "demo"
     """Language task prompt for the data exporter."""
@@ -375,6 +381,10 @@ def main(config: DataCollectionLaunchConfig):
         pico_cmd += " --vis_smpl"
     if config.pico_waist_tracking:
         pico_cmd += " --waist_tracking"
+    if config.pico_eef and config.pico_eef != "none":
+        pico_cmd += f" --eef {config.pico_eef}"
+        if config.pico_dds_interface:
+            pico_cmd += f" --dds-interface {config.pico_dds_interface}"
 
     print("Starting PICO teleop streamer (pane 2)...")
     _send_to_pane(1, pico_cmd, wait=2.0)

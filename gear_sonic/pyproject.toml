@@ -103,7 +103,7 @@ training = [
 
 [tool.setuptools.packages.find]
 where = [".."]
-include = ["gear_sonic*"]
+include = ["gear_sonic*", "eef*"]
 
 [tool.setuptools]
 include-package-data = true

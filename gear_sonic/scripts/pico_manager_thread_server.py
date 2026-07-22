@@ -85,6 +85,11 @@ except ImportError:
     G1GripperInverseKinematicsSolver = None
 
 try:
+    from eef.brainco.brainco import Brainco
+except ImportError:
+    Brainco = None
+
+try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
@@ -614,6 +619,69 @@ def get_controller_inputs():
     right_grip = xrt.get_right_grip()
     left_menu_button = xrt.get_left_menu_button()
     return left_menu_button, left_trigger, right_trigger, left_grip, right_grip
+
+
+TRIGGER_DEADZONE = 0.05
+
+
+def _apply_trigger_deadzone(value: float, deadzone: float = TRIGGER_DEADZONE) -> float:
+    """Map trigger [0,1] with a small deadzone near fully open."""
+    value = float(np.clip(value, 0.0, 1.0))
+    if value < deadzone:
+        return 0.0
+    return (value - deadzone) / (1.0 - deadzone)
+
+
+def create_brainco_hand(network_interface: str | None = None):
+    """Create an active Brainco controller, or raise if unavailable."""
+    if Brainco is None:
+        raise ImportError(
+            "Brainco driver not available. Ensure eef.brainco is installed "
+            "(pip install -e gear_sonic[teleop]) and unitree_sdk2py is present."
+        )
+    print(
+        f"[Brainco] Initializing active hand control "
+        f"(dds_interface={network_interface or 'default'})..."
+    )
+    hand = Brainco(passive=False, network_interface=network_interface)
+    hand.change_open_pose(801)
+    hand.set_gripper_targets(0.0, 0.0)
+    print("[Brainco] Ready. Left/right trigger control open(0)->close(1).")
+    return hand
+
+
+_brainco_trigger_log_t = 0.0
+
+
+def update_brainco_from_triggers(hand, left_trigger: float, right_trigger: float) -> None:
+    """Drive Brainco open/close from Pico trigger values."""
+    if hand is None:
+        return
+    l = _apply_trigger_deadzone(left_trigger)
+    r = _apply_trigger_deadzone(right_trigger)
+    hand.set_gripper_targets(l, r)
+    # Low-rate debug so smoke tests can confirm triggers are reaching the driver.
+    global _brainco_trigger_log_t
+    now = time.time()
+    if (l > 0.0 or r > 0.0) and (now - _brainco_trigger_log_t) > 1.0:
+        print(f"[Brainco] trigger L={l:.2f} R={r:.2f}")
+        _brainco_trigger_log_t = now
+
+
+def shutdown_brainco_hand(hand) -> None:
+    """Open hands then stop DDS threads."""
+    if hand is None:
+        return
+    try:
+        hand.set_gripper_targets(0.0, 0.0)
+        time.sleep(0.15)
+    except Exception as exc:
+        print(f"[Brainco] Failed to open hands on shutdown: {exc}")
+    try:
+        hand.close()
+    except Exception as exc:
+        print(f"[Brainco] Failed to close controller: {exc}")
+    print("[Brainco] Shutdown complete")
 
 
 def get_controller_axes():
@@ -1814,6 +1882,8 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    eef: str = "none",
+    dds_interface: str = "enp4s0",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1831,6 +1901,12 @@ def run_pico_manager(
     while not xrt.is_body_data_available():
         print("waiting for body data...")
         time.sleep(1)
+
+    brainco_hand = None
+    if eef == "brainco":
+        brainco_hand = create_brainco_hand(network_interface=dds_interface or None)
+    elif eef not in ("", "none"):
+        raise ValueError(f"Unsupported --eef={eef!r}. Use 'none' or 'brainco'.")
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1894,6 +1970,8 @@ def run_pico_manager(
     #   POSE_PAUSE: right B tap toggles POSE <-> POSE_PAUSE
     #
     print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy, B=toggle pose pause")
+    if brainco_hand is not None:
+        print("Brainco hands: left/right trigger = open/close")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -1910,7 +1988,14 @@ def run_pico_manager(
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
-            _, _, _, left_grip_mgr, _ = get_controller_inputs()
+            _, left_trigger_mgr, right_trigger_mgr, left_grip_mgr, _ = get_controller_inputs()
+
+            # Brainco open/close whenever the driver is alive (including OFF / smoke test).
+            # Only force-open on emergency stop / process shutdown.
+            if brainco_hand is not None:
+                update_brainco_from_triggers(
+                    brainco_hand, left_trigger_mgr, right_trigger_mgr
+                )
 
             left_axis_click, _ = get_axis_clicks()
 
@@ -2038,6 +2123,9 @@ def run_pico_manager(
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
+                    # Open hands before hard exit (finally also cleans up).
+                    shutdown_brainco_hand(brainco_hand)
+                    brainco_hand = None
                     exit()
                 elif (
                     new_mode == StreamMode.PLANNER
@@ -2079,6 +2167,7 @@ def run_pico_manager(
         print("\nStopping manager...")
     finally:
         # Cleanup resources
+        shutdown_brainco_hand(brainco_hand)
         reader.stop()
         three_point.close()
         socket.close()
@@ -2170,6 +2259,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--eef",
+        type=str,
+        default="none",
+        choices=["none", "brainco"],
+        help="End-effector driver for hand open/close (default: none). "
+        "'brainco' maps left/right Pico triggers to Brainco gripper open/close.",
+    )
+    parser.add_argument(
+        "--dds-interface",
+        type=str,
+        default="enp4s0",
+        help="Network interface for Brainco DDS (default: enp4s0)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2210,6 +2313,8 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            eef=args.eef,
+            dds_interface=args.dds_interface,
         )
     else:
         # Run legacy single-thread pose streaming

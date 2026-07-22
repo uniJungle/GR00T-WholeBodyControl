@@ -98,6 +98,8 @@ uv pip install --no-build-isolation -e external_dependencies/XRoboToolkit-PC-Ser
 #   • sim extra depends on mujoco which may lack aarch64 wheels
 #   • unitree_sdk2_python requires CycloneDDS C lib (already on the robot)
 # They are only installed on desktop / x86 dev machines.
+# Brainco hand control (pico_manager --eef brainco) also needs unitree_sdk2_python
+# on the teleop PC, so keep it installed for non-Orin hosts.
 if [ "$ARCH" = "aarch64" ] && [ "$(whoami)" = "unitree" ]; then
     echo "[SKIP] Skipping sim extra & unitree_sdk2_python (onboard Jetson Orin)"
 else
@@ -105,10 +107,15 @@ else
     echo "[INFO] Installing sim extra …"
     uv pip install -e "gear_sonic[sim]"
 
-    # ── 7. Install unitree_sdk2_python (needed by the sim2sim bridge)
+    # ── 7. Install unitree_sdk2_python (needed by the sim2sim bridge + Brainco DDS)
     echo "[INFO] Installing unitree_sdk2_python …"
     uv pip install -e external_dependencies/unitree_sdk2_python
 fi
+
+# Reinstall teleop editable so `eef` package (Brainco) is discoverable from repo root.
+# Requires network the first time only; subsequent runs refresh local package metadata.
+echo "[INFO] Refreshing gear_sonic[teleop] editable install (includes eef) …"
+uv pip install -e "gear_sonic[teleop]"
 
 echo ""
 echo "══════════════════════════════════════════════════════════════"
@@ -117,4 +124,8 @@ echo ""
 echo "    source .venv_teleop/bin/activate"
 echo ""
 echo "  You should see (gear_sonic_teleop) in your prompt."
+echo ""
+echo "  Brainco hands (optional):"
+echo "    python gear_sonic/scripts/pico_manager_thread_server.py \\"
+echo "      --manager --eef brainco --dds-interface enp4s0"
 echo "══════════════════════════════════════════════════════════════"
