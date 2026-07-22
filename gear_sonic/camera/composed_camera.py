@@ -12,7 +12,7 @@ Usage (on robot)::
         --port 5555
 
 Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
-``usb``, or a path to an ``.mp4`` file for replay testing.
+``usb``, ``usb_stereo``, or a path to an ``.mp4`` file for replay testing.
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 """
@@ -53,7 +53,7 @@ class ComposedCameraConfig:
     """Camera configuration for the composed camera server."""
 
     ego_view_camera: str | None = "oak"
-    """Camera type for ego view: oak, oak_mono, realsense, zed, usb, or None."""
+    """Camera type for ego view: oak, oak_mono, realsense, zed, usb, usb_stereo, or None."""
 
     ego_view_device_id: str | None = None
     """Device ID for ego view camera (OAK MxID, RealSense serial, USB /dev/video index)."""
@@ -392,6 +392,19 @@ class ComposedCameraSensor(Sensor, SensorServer):
             print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
             return USBCameraSensor(
                 config=usb_config, mount_position=mount_position, device_index=device_idx
+            )
+
+        elif camera_type == "usb_stereo":
+            from gear_sonic.camera.drivers.usb_stereo_camera import (
+                USBStereoCameraConfig,
+                USBStereoCameraSensor,
+            )
+
+            stereo_config = USBStereoCameraConfig()
+            device_idx = int(device_id) if device_id else 0
+            print(f"Initializing USB stereo camera for type: {camera_type}, device: {device_idx}")
+            return USBStereoCameraSensor(
+                config=stereo_config, mount_position=mount_position, device_index=device_idx
             )
 
         else:

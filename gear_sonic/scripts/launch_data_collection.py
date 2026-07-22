@@ -132,11 +132,20 @@ class DataCollectionLaunchConfig:
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
 
+    task_name: str = "default_task"
+    """Task specific directory name."""
+
+    root_output_dir: str = "outputs"
+    """Root directory for saved LeRobot datasets."""
+
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
+
+    record_stereo_ego: bool = False
+    """Record head stereo (observation.images.ego_view_left / ego_view_right) in the dataset."""
 
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
@@ -283,7 +292,9 @@ def main(config: DataCollectionLaunchConfig):
     print("=" * 60)
     print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
     print(f"  Task prompt:     {config.task_prompt}")
-    print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
+    print(f"  Task name:       {config.task_name}")
+    print(f"  Dataset name:    {config.dataset_name or '(auto YYYY-MM-DD)'}")
+    print(f"  Output dir:      {config.root_output_dir}")
     print(f"  Deploy input:    {config.deploy_input_type}")
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
@@ -291,6 +302,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
+    print(f"  Stereo ego:      {'Yes' if config.record_stereo_ego else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
@@ -385,14 +397,18 @@ def main(config: DataCollectionLaunchConfig):
         f"source .venv_data_collection/bin/activate && "
         f"python gear_sonic/scripts/run_data_exporter.py "
         f"--task-prompt '{config.task_prompt}' "
+        f"--task-name '{config.task_name}' "
         f"--data-collection-frequency {config.data_exporter_frequency} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"--root-output-dir '{config.root_output_dir}'"
     )
     if config.dataset_name:
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+    if config.record_stereo_ego:
+        exporter_cmd += " --record-stereo-ego"
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 

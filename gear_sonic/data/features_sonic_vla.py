@@ -369,6 +369,32 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
     }
 
 
+def get_stereo_ego_camera_features() -> dict:
+    """Features for head stereo left/right eyes (``record_stereo_ego``)."""
+    return {
+        "observation.images.ego_view_left": {
+            "dtype": "video",
+            "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
+            "names": ["height", "width", "channel"],
+        },
+        "observation.images.ego_view_right": {
+            "dtype": "video",
+            "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
+            "names": ["height", "width", "channel"],
+        },
+    }
+
+
+def get_stereo_ego_camera_modality_config() -> dict:
+    """Modality config entries for head stereo left/right eyes."""
+    return {
+        "video": {
+            "ego_view_left": {"original_key": "observation.images.ego_view_left"},
+            "ego_view_right": {"original_key": "observation.images.ego_view_right"},
+        },
+    }
+
+
 def get_wrist_camera_features() -> dict:
     """Features for optional wrist cameras (added when ``record_wrist_cameras`` is enabled)."""
     return {

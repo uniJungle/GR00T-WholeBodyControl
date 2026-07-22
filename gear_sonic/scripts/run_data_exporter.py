@@ -29,12 +29,36 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import tyro
 import zmq
+import sys
+import os
+
+# Add unitree_sdk2_python to path for AudioClient
+# gear_sonic/scripts/ -> ../../external_dependencies/unitree_sdk2_python
+_UNITREE_SDK_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "../../external_dependencies/unitree_sdk2_python")
+)
+if _UNITREE_SDK_PATH not in sys.path:
+    sys.path.insert(0, _UNITREE_SDK_PATH)
+
+HAS_UNITREE_AUDIO = False
+_UNITREE_AUDIO_IMPORT_ERROR = None
+try:
+    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+    from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+
+    HAS_UNITREE_AUDIO = True
+except Exception as e:
+    _UNITREE_AUDIO_IMPORT_ERROR = e
+    ChannelFactoryInitialize = None  # type: ignore
+    AudioClient = None  # type: ignore
 
 from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.features_sonic_vla import (
     get_features_sonic_vla,
     get_g1_robot_model,
     get_modality_config_sonic_vla,
+    get_stereo_ego_camera_features,
+    get_stereo_ego_camera_modality_config,
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
@@ -61,6 +85,9 @@ class SonicDataExporterConfig:
     # Dataset
     dataset_name: str | None = None
     """Dataset name (auto-generated if creating new)."""
+
+    task_name: str = "default_task"
+    """Task specific directory name."""
 
     task_prompt: str = "demo"
     """Language task prompt."""
@@ -100,13 +127,56 @@ class SonicDataExporterConfig:
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
 
+    record_stereo_ego: bool = False
+    """Record head stereo as observation.images.ego_view_left / ego_view_right."""
+
     text_to_speech: bool = True
-    """Use text-to-speech voice feedback."""
+    """Use local pyttsx3 text-to-speech voice feedback (PC speaker)."""
+
+    robot_tts: bool = True
+    """Use G1 onboard AudioClient TTS over DDS (requires cyclonedds + unitree_sdk2py)."""
+
+    dds_interface: str = "enp4s0"
+    """Network interface connected to the robot (for Unitree DDS / AudioClient)."""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _create_robot_audio_client(dds_interface: str):
+    """Create a G1 AudioClient with voice-mode API registration.
+
+    Matches the working pattern from wbc_pico_record (VoiceModeClient + mode 3).
+    """
+    if not HAS_UNITREE_AUDIO:
+        raise RuntimeError(
+            f"unitree_sdk2py unavailable: {_UNITREE_AUDIO_IMPORT_ERROR}. "
+            "Install cyclonedds into .venv_data_collection "
+            "(e.g. copy from .venv_teleop or: uv pip install cyclonedds==0.10.2)."
+        )
+
+    class VoiceModeClient(AudioClient):
+        def Init(self):
+            super().Init()
+            # API 1008 is required for G1 voice mode switching.
+            self._RegistApi(1008, 0)
+
+        def SetVoiceMode(self, mode: int):
+            import json as _json
+
+            code, data = self._Call(1008, _json.dumps({"mode": mode}))
+            return code, data
+
+    ChannelFactoryInitialize(0, dds_interface)
+    client = VoiceModeClient()
+    client.SetTimeout(5.0)
+    client.Init()
+    client.SetVolume(100)
+    code, _ = client.SetVoiceMode(3)
+    print(f"[Audio] Voice mode set to 3 (code={code})")
+    return client
 
 
 class TimeDeltaException(Exception):
@@ -227,6 +297,8 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        robot_tts: bool = True,
+        dds_interface: str = "enp4s0",
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -246,6 +318,7 @@ class GrootDataCollector:
         self.latest_planner_msg = None
 
         self.current_stream_mode = 0
+        self._last_announced_stream_mode: int | None = None
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
@@ -282,11 +355,64 @@ class GrootDataCollector:
         self._last_latency_log_time = 0.0
         self._initial_yaw = None
 
+        self.audio_client = None
+        if robot_tts:
+            if not HAS_UNITREE_AUDIO:
+                print(
+                    f"[Audio] Disabled: cannot import unitree_sdk2py "
+                    f"({_UNITREE_AUDIO_IMPORT_ERROR}). "
+                    f"Looked in: {_UNITREE_SDK_PATH}"
+                )
+            else:
+                try:
+                    self.audio_client = _create_robot_audio_client(dds_interface)
+                    print(
+                        f"[Audio] Unitree AudioClient initialized on '{dds_interface}'."
+                    )
+                except Exception as e:
+                    print(f"[Audio] Failed to initialize Unitree AudioClient: {e}")
+                    self.audio_client = None
+
         print(f"Recording to {self.data_exporter.meta.root}")
 
     @property
     def current_episode_index(self):
         return self.data_exporter.episode_buffer["episode_index"]
+
+    def _robot_say(self, text: str, speaker_id: int = 0) -> None:
+        """Speak on the G1 speaker via AudioClient. Failures are logged, not raised."""
+        if self.audio_client is None:
+            return
+        try:
+            code = self.audio_client.TtsMaker(text, speaker_id)
+            if code != 0:
+                print(f"[Audio] TtsMaker('{text}') returned code={code}")
+        except Exception as e:
+            print(f"[Audio] TtsMaker('{text}') failed: {e}")
+
+    # Matches pico_manager StreamMode: A+X toggles POSE <-> PLANNER.
+    _STREAM_MODE_TTS = {
+        0: "模式关闭",
+        1: "进入遥操模式",       # POSE (A+X)
+        2: "进入规划模式",       # PLANNER (A+X)
+        3: "进入上半身冻结规划",  # PLANNER_FROZEN_UPPER_BODY (B+Y)
+        4: "遥操暂停",           # POSE_PAUSE (tap right B to toggle)
+        5: "进入三点追踪模式",    # PLANNER_VR_3PT
+    }
+
+    def _announce_stream_mode(self, mode: int) -> None:
+        """Announce stream-mode changes (e.g. A+X POSE <-> PLANNER)."""
+        if self._last_announced_stream_mode is None:
+            # First packet: sync silently, avoid speaking on exporter startup.
+            self._last_announced_stream_mode = mode
+            return
+        if mode == self._last_announced_stream_mode:
+            return
+        prev = self._last_announced_stream_mode
+        self._last_announced_stream_mode = mode
+        text = self._STREAM_MODE_TTS.get(mode, f"切换到模式{mode}")
+        print(f"[Mode] stream_mode {prev} -> {mode}: {text}")
+        self._robot_say(text)
 
     def _print_and_say(self, message: str, say: bool = True, blocking: bool = False):
         if self.text_to_speech is not None:
@@ -323,8 +449,10 @@ class GrootDataCollector:
                 self._print_and_say(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
+                self._robot_say("开始录制")
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
+                # TTS deferred to _finalize_frame after save succeeds ("保存第i条数据").
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
@@ -333,6 +461,7 @@ class GrootDataCollector:
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
+                self._robot_say("放弃当前录制")
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -360,7 +489,11 @@ class GrootDataCollector:
             return
 
         if "stream_mode" in data:
-            self.current_stream_mode = int(data["stream_mode"].flat[0])
+            new_mode = int(data["stream_mode"].flat[0])
+            self.current_stream_mode = new_mode
+            # A+X (and other manager combos) change stream_mode in pico_manager;
+            # announce here so we reuse the existing AudioClient (avoid dual DDS clients).
+            self._announce_stream_mode(new_mode)
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
@@ -545,10 +678,15 @@ class GrootDataCollector:
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                # episode_index is scoped to the current dataset path (continues on resume).
+                saved_episode_index = int(self.data_exporter.episode_buffer["episode_index"])
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
-                self._print_and_say("Finished saving episode")
+                # 1-based for human speech; matches episode_XXXXXX under this save root.
+                episode_no = saved_episode_index + 1
+                self._print_and_say(f"Finished saving episode {saved_episode_index}")
+                self._robot_say(f"保存第{episode_no}条数据")
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
@@ -924,6 +1062,19 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    if config.record_stereo_ego:
+        print("[Camera] Head stereo enabled — ego_view_left / ego_view_right")
+        # Replace mono ego_view with left/right stereo keys.
+        dataset_features.pop("observation.images.ego_view", None)
+        dataset_features.update(get_stereo_ego_camera_features())
+        modality_config.get("video", {}).pop("ego_view", None)
+        stereo_modality = get_stereo_ego_camera_modality_config()
+        for key, value in stereo_modality.items():
+            if key in modality_config:
+                modality_config[key].update(value)
+            else:
+                modality_config[key] = value
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -931,12 +1082,12 @@ def main(config: SonicDataExporterConfig):
     )
 
     data_exporter = Gr00tDataExporter.create(
-        save_root=f"{config.root_output_dir}/{config.dataset_name}",
+        save_root=f"{config.root_output_dir}/{config.task_name}/{config.dataset_name}",
         fps=config.data_collection_frequency,
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
-        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras},
+        script_config={**robot_config, "record_wrist_cameras": config.record_wrist_cameras, "record_stereo_ego": config.record_stereo_ego},
     )
 
     data_collector = GrootDataCollector(
@@ -950,6 +1101,8 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        robot_tts=config.robot_tts,
+        dds_interface=config.dds_interface,
     )
     data_collector.run()
 
@@ -958,6 +1111,6 @@ if __name__ == "__main__":
     config = tyro.cli(SonicDataExporterConfig)
 
     if config.dataset_name is None:
-        config.dataset_name = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        config.dataset_name = datetime.now().strftime("%Y-%m-%d")
 
     main(config)
