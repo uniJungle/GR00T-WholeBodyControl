@@ -42,12 +42,20 @@ def _get_joint_group_slices(robot_model: RobotModel) -> dict[str, dict[str, int]
     return slices
 
 
-def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
+def get_modality_config_sonic_vla(robot_model: RobotModel, eef: str = "dex3") -> dict:
     """Return the modality config for the Sonic VLA dataset.
 
     Produces the exact content of meta/modality.json.
     """
     group_slices = _get_joint_group_slices(robot_model)
+
+    if eef == "brainco":
+        # Override hand slices for 2-dim brainco
+        group_slices["left_hand"] = {"start": 29, "end": 31}
+        group_slices["right_hand"] = {"start": 31, "end": 33}
+        hand_dim = 2
+    else:
+        hand_dim = 7
 
     return {
         "state": {
@@ -133,12 +141,12 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
             },
             "left_hand_joints": {
                 "start": 0,
-                "end": 7,
+                "end": hand_dim,
                 "original_key": "teleop.left_hand_joints",
             },
             "right_hand_joints": {
                 "start": 0,
-                "end": 7,
+                "end": hand_dim,
                 "original_key": "teleop.right_hand_joints",
             },
             "left_wrist_joints": {
@@ -202,13 +210,26 @@ def get_modality_config_sonic_vla(robot_model: RobotModel) -> dict:
     }
 
 
-def get_features_sonic_vla(robot_model: RobotModel) -> dict:
+def get_features_sonic_vla(robot_model: RobotModel, eef: str = "dex3") -> dict:
     """Return the dataset features for the Sonic VLA dataset.
 
     The returned dict populates the "features" key of meta/info.json.
     """
-    joint_names = robot_model.joint_names
-    num_joints = robot_model.num_joints
+    if eef == "brainco":
+        joint_names = robot_model.joint_names[:29] + [
+            "left_hand_thumb_aux", "left_hand_others",
+            "right_hand_thumb_aux", "right_hand_others"
+        ]
+        num_joints = 33
+        hand_dim = 2
+        hand_names_left = ["left_hand_thumb_aux", "left_hand_others"]
+        hand_names_right = ["right_hand_thumb_aux", "right_hand_others"]
+    else:
+        joint_names = robot_model.joint_names
+        num_joints = robot_model.num_joints
+        hand_dim = 7
+        hand_names_left = "left_hand_joints"
+        hand_names_right = "right_hand_joints"
 
     return {
         "observation.images.ego_view": {
@@ -295,13 +316,13 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
         },
         "teleop.left_hand_joints": {
             "dtype": "float32",
-            "shape": (7,),
-            "names": "left_hand_joints",
+            "shape": (hand_dim,),
+            "names": hand_names_left,
         },
         "teleop.right_hand_joints": {
             "dtype": "float32",
-            "shape": (7,),
-            "names": "right_hand_joints",
+            "shape": (hand_dim,),
+            "names": hand_names_right,
         },
         "teleop.smpl_frame_index": {
             "dtype": "int64",

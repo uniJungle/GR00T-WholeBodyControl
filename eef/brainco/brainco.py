@@ -83,9 +83,33 @@ class Brainco:
         left_ratio = float(np.clip(left_ratio, 0.0, 1.0))
         right_ratio = float(np.clip(right_ratio, 0.0, 1.0))
 
-        open_p = self.open_pose.copy()
-        l_cmd = open_p + (self.close_pose - open_p) * left_ratio
-        r_cmd = open_p + (self.close_pose - open_p) * right_ratio
+        # 提取为 2-dim 控制逻辑：
+        # dim 0: ThumbAux (index 1)
+        # dim 1: 其他 5 个电机 (index 0, 2, 3, 4, 5)
+        l_thumb_aux = self.open_pose[1] + (self.close_pose[1] - self.open_pose[1]) * left_ratio
+        l_others = self.open_pose[0] + (self.close_pose[0] - self.open_pose[0]) * left_ratio
+        
+        r_thumb_aux = self.open_pose[1] + (self.close_pose[1] - self.open_pose[1]) * right_ratio
+        r_others = self.open_pose[0] + (self.close_pose[0] - self.open_pose[0]) * right_ratio
+
+        self.set_2d_targets([l_thumb_aux, l_others], [r_thumb_aux, r_others])
+
+    def set_2d_targets(self, left_2d, right_2d):
+        """
+        直接下发 2-dim 控制指令。
+        left_2d, right_2d: [thumb_aux_val, others_val]
+        """
+        if self.passive:
+            return
+
+        def to_6d(val_2d):
+            cmd = np.zeros(6, dtype=np.float64)
+            cmd[1] = val_2d[0]                # ThumbAux
+            cmd[[0, 2, 3, 4, 5]] = val_2d[1]  # Thumb, Index, Middle, Ring, Pinky
+            return cmd
+
+        l_cmd = to_6d(left_2d)
+        r_cmd = to_6d(right_2d)
 
         with self.left_hand_pos_array.get_lock():
             self.left_hand_pos_array[:] = l_cmd
@@ -94,6 +118,21 @@ class Brainco:
 
         self.l_cmd = l_cmd
         self.r_cmd = r_cmd
+
+    def get_2d_states(self):
+        """
+        获取 2-dim 的手部状态反馈 (基于 6-dim 实测值的均值聚合)。
+        返回: left_2d, right_2d
+        """
+        left_6d, right_6d = self.get_hand_states()
+
+        def to_2d(val_6d):
+            arr = np.asarray(val_6d, dtype=np.float64).reshape(-1)
+            thumb_aux = arr[1]
+            others_mean = float(np.mean(arr[[0, 2, 3, 4, 5]]))
+            return np.array([thumb_aux, others_mean], dtype=np.float64)
+
+        return to_2d(left_6d), to_2d(right_6d)
 
     def set_hand_targets(self, targets):
         if self.passive:

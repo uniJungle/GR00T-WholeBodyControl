@@ -139,16 +139,22 @@ class SonicDataExporterConfig:
     dds_interface: str = "enp4s0"
     """Network interface connected to the robot (for Unitree DDS / AudioClient)."""
 
+    eef: str = "dex3"
+    """End-effector driver: 'dex3' (7-dim) or 'brainco' (2-dim)."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _create_robot_audio_client(dds_interface: str):
+def _create_robot_audio_client(dds_interface: str, init_channel_factory: bool = True):
     """Create a G1 AudioClient with voice-mode API registration.
 
     Matches the working pattern from wbc_pico_record (VoiceModeClient + mode 3).
+
+    If ``init_channel_factory`` is False, assume ChannelFactory was already
+    initialized (e.g. by Brainco passive monitor on the same process).
     """
     if not HAS_UNITREE_AUDIO:
         raise RuntimeError(
@@ -169,13 +175,39 @@ def _create_robot_audio_client(dds_interface: str):
             code, data = self._Call(1008, _json.dumps({"mode": mode}))
             return code, data
 
-    ChannelFactoryInitialize(0, dds_interface)
+        def TtsMaker(self, text: str, speaker_id: int):
+            # Upstream unitree_sdk2py does ``tts_index += tts_index`` which stays
+            # at 0 forever when starting from 0; G1 then ignores repeated TTS.
+            import json as _json
+            from unitree_sdk2py.g1.audio.g1_audio_api import (
+                ROBOT_API_ID_AUDIO_STOP_PLAY,
+                ROBOT_API_ID_AUDIO_TTS,
+            )
+
+            # Stop any in-flight playback so the new phrase is not dropped.
+            try:
+                self._Call(ROBOT_API_ID_AUDIO_STOP_PLAY, _json.dumps({}))
+            except Exception:
+                pass
+            self.SetVolume(100)
+            self.tts_index = int(getattr(self, "tts_index", 0)) + 1
+            parameter = _json.dumps(
+                {"index": self.tts_index, "text": text, "speaker_id": int(speaker_id)}
+            )
+            code, _data = self._Call(ROBOT_API_ID_AUDIO_TTS, parameter)
+            return code
+
+    if init_channel_factory:
+        ChannelFactoryInitialize(0, dds_interface)
     client = VoiceModeClient()
     client.SetTimeout(5.0)
     client.Init()
     client.SetVolume(100)
     code, _ = client.SetVoiceMode(3)
     print(f"[Audio] Voice mode set to 3 (code={code})")
+    # Smoke test so startup proves the robot speaker path works.
+    tts_code = client.TtsMaker("数据录制已就绪", 0)
+    print(f"[Audio] Startup TtsMaker code={tts_code}")
     return client
 
 
@@ -253,19 +285,23 @@ class TimingThresholdMonitor:
             self.failure_count += 1
             self.last_failure_time = time.monotonic()
 
-        if self.is_threshold_exceeded():
-            print(
-                f"Time delta exception: {self.failure_count} failures in "
-                f"{self.reset_timeout_sec} seconds, time delta: {time_delta}"
-            )
-            if self.raise_exception:
-                raise TimeDeltaException(self.failure_count, self.reset_timeout_sec)
+            if self.is_threshold_exceeded():
+                print(
+                    f"Time delta exception: {self.failure_count} failures in "
+                    f"{self.reset_timeout_sec} seconds, time delta: {time_delta}"
+                )
+                if self.raise_exception:
+                    raise TimeDeltaException(self.failure_count, self.reset_timeout_sec)
+        else:
+            # Clear failures if we get a good reading
+            self.reset()
 
     def is_threshold_exceeded(self):
-        if self.failure_count >= self.max_failures:
-            return True
         if time.monotonic() - self.last_failure_time > self.reset_timeout_sec:
             self.reset()
+            return False
+        if self.failure_count >= self.max_failures:
+            return True
         return False
 
 
@@ -299,12 +335,40 @@ class GrootDataCollector:
         state_zmq_port: int = 5557,
         robot_tts: bool = True,
         dds_interface: str = "enp4s0",
+        eef: str = "dex3",
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self.eef = eef
+        self.hand_dim = 2 if eef == "brainco" else 7
+
+        # Unitree DDS ChannelFactory can only be initialized once per process.
+        # Brainco passive monitor and G1 AudioClient both need it — init once here.
+        dds_factory_ready = False
+        need_dds = (self.eef == "brainco") or robot_tts
+        if need_dds and ChannelFactoryInitialize is not None:
+            try:
+                ChannelFactoryInitialize(0, dds_interface)
+                dds_factory_ready = True
+                print(f"[DDS] ChannelFactory initialized on '{dds_interface}'.")
+            except Exception as e:
+                print(f"[DDS] ChannelFactoryInitialize failed: {e}")
+
+        self.brainco_hand = None
+        if self.eef == "brainco":
+            from eef.brainco.brainco import Brainco
+
+            self.brainco_hand = Brainco(
+                passive=True,
+                network_interface=dds_interface,
+                init_channel_factory=not dds_factory_ready,
+            )
+            if not dds_factory_ready:
+                dds_factory_ready = True
+            print("[Brainco] Passive mode initialized for data recording (2-dim).")
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -319,6 +383,7 @@ class GrootDataCollector:
 
         self.current_stream_mode = 0
         self._last_announced_stream_mode: int | None = None
+        self._last_announced_locomotion_mode: int | None = None
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
@@ -365,7 +430,10 @@ class GrootDataCollector:
                 )
             else:
                 try:
-                    self.audio_client = _create_robot_audio_client(dds_interface)
+                    self.audio_client = _create_robot_audio_client(
+                        dds_interface,
+                        init_channel_factory=not dds_factory_ready,
+                    )
                     print(
                         f"[Audio] Unitree AudioClient initialized on '{dds_interface}'."
                     )
@@ -382,26 +450,25 @@ class GrootDataCollector:
     def _robot_say(self, text: str, speaker_id: int = 0) -> None:
         """Speak on the G1 speaker via AudioClient. Failures are logged, not raised."""
         if self.audio_client is None:
+            print(f"[Audio] skip TtsMaker (no client): {text}")
             return
         try:
             code = self.audio_client.TtsMaker(text, speaker_id)
-            if code != 0:
-                print(f"[Audio] TtsMaker('{text}') returned code={code}")
+            print(f"[Audio] TtsMaker('{text}') code={code}")
         except Exception as e:
             print(f"[Audio] TtsMaker('{text}') failed: {e}")
 
-    # Matches pico_manager StreamMode: A+X toggles POSE <-> PLANNER.
+    # Matches pico_manager StreamMode. Only these modes are spoken on the robot.
+    # 3 (PLANNER_FROZEN_UPPER_BODY) / 5 (PLANNER_VR_3PT) intentionally omitted.
     _STREAM_MODE_TTS = {
-        0: "模式关闭",
+        0: "模式关闭",           # OFF
         1: "进入遥操模式",       # POSE (A+X)
         2: "进入规划模式",       # PLANNER (A+X)
-        3: "进入上半身冻结规划",  # PLANNER_FROZEN_UPPER_BODY (B+Y)
-        4: "遥操暂停",           # POSE_PAUSE (tap right B to toggle)
-        5: "进入三点追踪模式",    # PLANNER_VR_3PT
+        4: "遥操暂停",           # POSE_PAUSE (tap right Y)
     }
 
     def _announce_stream_mode(self, mode: int) -> None:
-        """Announce stream-mode changes (e.g. A+X POSE <-> PLANNER)."""
+        """Track stream-mode changes; TTS is handled by pico_manager (reliable AudioClient)."""
         if self._last_announced_stream_mode is None:
             # First packet: sync silently, avoid speaking on exporter startup.
             self._last_announced_stream_mode = mode
@@ -410,9 +477,23 @@ class GrootDataCollector:
             return
         prev = self._last_announced_stream_mode
         self._last_announced_stream_mode = mode
-        text = self._STREAM_MODE_TTS.get(mode, f"切换到模式{mode}")
-        print(f"[Mode] stream_mode {prev} -> {mode}: {text}")
-        self._robot_say(text)
+        text = self._STREAM_MODE_TTS.get(mode)
+        if text is None:
+            print(f"[Mode] stream_mode {prev} -> {mode}: (no TTS, pico owns voice)")
+            return
+        # Log only — pico announces on the working speaker path.
+        print(f"[Mode] stream_mode {prev} -> {mode}: {text} (TTS via pico)")
+
+    def _announce_locomotion_mode(self, mode: int) -> None:
+        """Track locomotion changes; SLOW_WALK TTS is spoken by pico_manager."""
+        if self._last_announced_locomotion_mode is None:
+            self._last_announced_locomotion_mode = mode
+            return
+        if mode == self._last_announced_locomotion_mode:
+            return
+        prev = self._last_announced_locomotion_mode
+        self._last_announced_locomotion_mode = mode
+        print(f"[Mode] locomotion_mode {prev} -> {mode} (TTS via pico if SLOW_WALK)")
 
     def _print_and_say(self, message: str, say: bool = True, blocking: bool = False):
         if self.text_to_speech is not None:
@@ -457,11 +538,12 @@ class GrootDataCollector:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
+                discarded_idx = int(self.data_exporter.episode_buffer["episode_index"])
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
-                self._robot_say("放弃当前录制")
+                self._robot_say(f"丢弃第{discarded_idx + 1}条")
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
@@ -494,6 +576,10 @@ class GrootDataCollector:
             # A+X (and other manager combos) change stream_mode in pico_manager;
             # announce here so we reuse the existing AudioClient (avoid dual DDS clients).
             self._announce_stream_mode(new_mode)
+
+        if "locomotion_mode" in data:
+            loco_mode = int(np.asarray(data["locomotion_mode"]).flat[0])
+            self._announce_locomotion_mode(loco_mode)
 
         if self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
@@ -625,14 +711,13 @@ class GrootDataCollector:
             if self._sonic_error_count == 1 or self._sonic_error_count % 100 == 0:
                 print(f"[Sonic] Error processing pose message: {e}")
 
-    @staticmethod
-    def _extract_hand_joints(pose_data: dict, key: str) -> np.ndarray:
+    def _extract_hand_joints(self, pose_data: dict, key: str) -> np.ndarray:
         arr = pose_data.get(key)
         if arr is not None:
             if arr.ndim > 1:
                 arr = arr[0]
             return arr.astype(np.float32)
-        return np.zeros(7, dtype=np.float32)
+        return np.zeros(self.hand_dim, dtype=np.float32)
 
     @staticmethod
     def _extract_bool(pose_data: dict, key: str) -> bool:
@@ -714,18 +799,46 @@ class GrootDataCollector:
         assert self.latest_proprio_msg is not None
         proprio = self.latest_proprio_msg
 
-        whole_q = self.robot_model.get_configuration_from_actuated_joints(
-            body_actuated_joint_values=proprio["body_q"],
-            left_hand_actuated_joint_values=proprio["left_hand_q"],
-            right_hand_actuated_joint_values=proprio["right_hand_q"],
-        )
-        whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
-            body_actuated_joint_values=proprio["last_action"],
-            left_hand_actuated_joint_values=proprio["last_left_hand_action"],
-            right_hand_actuated_joint_values=proprio["last_right_hand_action"],
-        )
+        if self.eef == "brainco" and self.brainco_hand is not None:
+            # 2-dim Brainco: [thumb_aux, others]; do not feed into Dex3 7-DoF robot_model.
+            left_hand_q, right_hand_q = self.brainco_hand.get_2d_states()
+            left_hand_action, right_hand_action = left_hand_q, right_hand_q
+            body_q = np.asarray(proprio["body_q"], dtype=np.float64).reshape(-1)
+            body_action = np.asarray(proprio["last_action"], dtype=np.float64).reshape(-1)
+            whole_q = np.concatenate(
+                [body_q, left_hand_q.astype(np.float64), right_hand_q.astype(np.float64)]
+            )
+            whole_action_wbc = np.concatenate(
+                [
+                    body_action,
+                    left_hand_action.astype(np.float64),
+                    right_hand_action.astype(np.float64),
+                ]
+            )
+            # FK for wrist pose only needs body joints; pad Dex3 hand slots with zeros.
+            fk_q = self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=body_q,
+                left_hand_actuated_joint_values=np.zeros(7, dtype=np.float64),
+                right_hand_actuated_joint_values=np.zeros(7, dtype=np.float64),
+            )
+        else:
+            left_hand_q = proprio["left_hand_q"]
+            right_hand_q = proprio["right_hand_q"]
+            left_hand_action = proprio["last_left_hand_action"]
+            right_hand_action = proprio["last_right_hand_action"]
+            whole_q = self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=proprio["body_q"],
+                left_hand_actuated_joint_values=left_hand_q,
+                right_hand_actuated_joint_values=right_hand_q,
+            )
+            whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=proprio["last_action"],
+                left_hand_actuated_joint_values=left_hand_action,
+                right_hand_actuated_joint_values=right_hand_action,
+            )
+            fk_q = whole_q
 
-        self.robot_model.cache_forward_kinematics(whole_q)
+        self.robot_model.cache_forward_kinematics(fk_q)
         eef_parts = []
         for side in ["left", "right"]:
             placement = self.robot_model.frame_placement(
@@ -891,18 +1004,23 @@ class GrootDataCollector:
             else planner_msg if planner_msg is not None
             else smpl_msg
         )
-        frame_data["teleop.left_hand_joints"] = (
-            hand_msg["left_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("left_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
-        )
-        frame_data["teleop.right_hand_joints"] = (
-            hand_msg["right_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("right_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
-        )
+        if self.eef == "brainco" and self.brainco_hand is not None:
+            left_2d, right_2d = self.brainco_hand.get_2d_states()
+            frame_data["teleop.left_hand_joints"] = left_2d.astype(np.float32)
+            frame_data["teleop.right_hand_joints"] = right_2d.astype(np.float32)
+        else:
+            frame_data["teleop.left_hand_joints"] = (
+                hand_msg["left_hand_joints"].astype(np.float32)
+                if hand_msg is not None
+                and hand_msg.get("left_hand_joints") is not None
+                else np.zeros(self.hand_dim, dtype=np.float32)
+            )
+            frame_data["teleop.right_hand_joints"] = (
+                hand_msg["right_hand_joints"].astype(np.float32)
+                if hand_msg is not None
+                and hand_msg.get("right_hand_joints") is not None
+                else np.zeros(self.hand_dim, dtype=np.float32)
+            )
 
         # Planner command fields
         frame_data["teleop.planner_mode"] = np.array(
@@ -1049,8 +1167,8 @@ class GrootDataCollector:
 def main(config: SonicDataExporterConfig):
     g1_rm = get_g1_robot_model()
 
-    dataset_features = get_features_sonic_vla(g1_rm)
-    modality_config = get_modality_config_sonic_vla(g1_rm)
+    dataset_features = get_features_sonic_vla(g1_rm, eef=config.eef)
+    modality_config = get_modality_config_sonic_vla(g1_rm, eef=config.eef)
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -1103,6 +1221,7 @@ def main(config: SonicDataExporterConfig):
         state_zmq_port=config.state_zmq_port,
         robot_tts=config.robot_tts,
         dds_interface=config.dds_interface,
+        eef=config.eef,
     )
     data_collector.run()
 

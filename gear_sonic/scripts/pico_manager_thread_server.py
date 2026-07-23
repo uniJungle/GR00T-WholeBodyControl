@@ -24,6 +24,7 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import json
 import os
 import subprocess
 import threading
@@ -648,6 +649,79 @@ def create_brainco_hand(network_interface: str | None = None):
     hand.set_gripper_targets(0.0, 0.0)
     print("[Brainco] Ready. Left/right trigger control open(0)->close(1).")
     return hand
+
+
+def create_robot_tts_client(
+    network_interface: str | None = None,
+    *,
+    init_channel_factory: bool = True,
+):
+    """Create G1 AudioClient for onboard TTS (shares ChannelFactory with Brainco)."""
+    try:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+        from unitree_sdk2py.g1.audio.g1_audio_api import (
+            ROBOT_API_ID_AUDIO_STOP_PLAY,
+            ROBOT_API_ID_AUDIO_TTS,
+        )
+    except Exception as e:
+        print(f"[Audio] unitree_sdk2py unavailable, skip robot TTS: {e}")
+        return None
+
+    class VoiceModeClient(AudioClient):
+        def Init(self):
+            super().Init()
+            self._RegistApi(1008, 0)
+
+        def SetVoiceMode(self, mode: int):
+            code, data = self._Call(1008, json.dumps({"mode": mode}))
+            return code, data
+
+        def StopPlay(self):
+            code, _ = self._Call(ROBOT_API_ID_AUDIO_STOP_PLAY, json.dumps({}))
+            return code
+
+        def TtsMaker(self, text: str, speaker_id: int = 0):
+            # Upstream does ``tts_index += tts_index`` which stays at 0.
+            self.tts_index = int(getattr(self, "tts_index", 0)) + 1
+            parameter = json.dumps(
+                {"index": self.tts_index, "text": text, "speaker_id": int(speaker_id)}
+            )
+            code, _ = self._Call(ROBOT_API_ID_AUDIO_TTS, parameter)
+            return code
+
+    try:
+        if init_channel_factory:
+            if network_interface:
+                ChannelFactoryInitialize(0, network_interface)
+            else:
+                ChannelFactoryInitialize(0)
+        client = VoiceModeClient()
+        client.SetTimeout(5.0)
+        client.Init()
+        client.SetVolume(100)
+        mode_code, _ = client.SetVoiceMode(3)
+        print(f"[Audio] VoiceMode=3 code={mode_code} iface={network_interface or 'default'}")
+        tts_code = client.TtsMaker("语音已就绪", 0)
+        print(f"[Audio] Startup TTS code={tts_code}")
+        return client
+    except Exception as e:
+        print(f"[Audio] Failed to init robot TTS: {e}")
+        return None
+
+
+def robot_say(audio_client, text: str) -> None:
+    """Speak on G1; never raise into the control loop."""
+    if audio_client is None:
+        return
+    try:
+        audio_client.SetVolume(100)
+        if hasattr(audio_client, "StopPlay"):
+            audio_client.StopPlay()
+        code = audio_client.TtsMaker(text, 0)
+        print(f"[Audio] TtsMaker('{text}') code={code}")
+    except Exception as e:
+        print(f"[Audio] TtsMaker('{text}') failed: {e}")
 
 
 _brainco_trigger_log_t = 0.0
@@ -1693,6 +1767,7 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        audio_client=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1702,14 +1777,13 @@ class PlannerStreamer:
         )
 
         self.dt = 1.0 / max(1, poll_hz)
-        # Current locomotion mode, default IDLE
-        self.mode = LocomotionMode.IDLE
-        self.prev_ab = False
-        self.prev_xy = False
+        # Planner locomotion is fixed to SLOW_WALK (no A+B / X+Y mode cycling).
+        self.mode = LocomotionMode.SLOW_WALK
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
         self.last_xrt_timestamp = None
+        self.audio_client = audio_client
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
@@ -1717,6 +1791,9 @@ class PlannerStreamer:
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
         self.yaw_accumulator.reset()
+        self.mode = LocomotionMode.SLOW_WALK
+        # Stream-mode TTS already says「进入规划模式」; skip「进入慢走模式」.
+        print(f"[PlannerLoop] Mode locked -> {self.mode.value}: {self.mode.name}")
 
     def save_upper_body_position_target(self):
         """Poll feedback and save upper body position target."""
@@ -1751,18 +1828,8 @@ class PlannerStreamer:
                 return
             self.last_xrt_timestamp = xrt_timestamp
 
-            # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
-            ab_now = bool(a_pressed) and bool(b_pressed)
-            xy_now = bool(x_pressed) and bool(y_pressed)
-            if ab_now and not self.prev_ab:
-                self.mode = LocomotionMode(min(LocomotionMode.INJURED_WALK, self.mode + 1))
-                print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
-            if xy_now and not self.prev_xy:
-                self.mode = LocomotionMode(max(LocomotionMode.IDLE, self.mode - 1))
-                print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
-            self.prev_ab = ab_now
-            self.prev_xy = xy_now
+            # Locomotion mode is fixed to SLOW_WALK; A+B / X+Y no longer cycle modes.
+            # (A+B+X+Y emergency stop is handled in the outer manager loop.)
 
             # Read axes/joysticks to control movement, facing, speed and mode
             lx, ly, rx, ry = get_controller_axes()
@@ -1775,21 +1842,14 @@ class PlannerStreamer:
             if np.abs(raw_mag) < JOYSTICK_DEADZONE:
                 mag = 0.0
                 speed = -1.0
+                # Stick released: send IDLE so the robot stands still.
                 mode_to_send = LocomotionMode.IDLE
             else:
                 mag = (raw_mag - JOYSTICK_DEADZONE) / (1.0 - JOYSTICK_DEADZONE)
                 if mag > 1.0:
                     mag = 1.0
-                mode_to_send = self.mode
-
-                if self.mode == LocomotionMode.SLOW_WALK:
-                    speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
-                elif self.mode == LocomotionMode.WALK:
-                    speed = -1.0
-                elif self.mode == LocomotionMode.RUN:
-                    speed = 1.5 + 3 * mag  # 1.5 .. 4.5
-                else:
-                    speed = mag  # default 0 .. 1.0
+                mode_to_send = LocomotionMode.SLOW_WALK
+                speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
 
             denom = raw_mag if raw_mag > 0.0 else 1.0
             scale = mag / denom
@@ -1908,6 +1968,12 @@ def run_pico_manager(
     elif eef not in ("", "none"):
         raise ValueError(f"Unsupported --eef={eef!r}. Use 'none' or 'brainco'.")
 
+    # Share ChannelFactory with Brainco when already initialized.
+    audio_client = create_robot_tts_client(
+        dds_interface or None,
+        init_channel_factory=(brainco_hand is None),
+    )
+
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
@@ -1916,9 +1982,8 @@ def run_pico_manager(
 
     # Print available locomotion modes
     try:
-        print("[Manager] Available modes:")
-        for mode in LocomotionMode:
-            print(f"  {mode.value}: {mode.name}")
+        print("[Manager] Planner locomotion locked to SLOW_WALK (A+B/X+Y mode cycling disabled)")
+        print(f"  {LocomotionMode.SLOW_WALK.value}: {LocomotionMode.SLOW_WALK.name}")
     except Exception:
         pass
 
@@ -1952,6 +2017,7 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        audio_client=audio_client,
     )
 
     # State machine diagram:
@@ -1967,9 +2033,10 @@ def run_pico_manager(
     #                                                   (ax)--> POSE
     #
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
-    #   POSE_PAUSE: right B tap toggles POSE <-> POSE_PAUSE
+    #   POSE_PAUSE: right Y alone toggles POSE <-> POSE_PAUSE
+    #               (must not hold B — B+Y is frozen-upper-body chain)
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy, B=toggle pose pause")
+    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy, Y=toggle pose pause")
     if brainco_hand is not None:
         print("Brainco hands: left/right trigger = open/close")
     current_mode = StreamMode.OFF
@@ -1991,8 +2058,9 @@ def run_pico_manager(
             _, left_trigger_mgr, right_trigger_mgr, left_grip_mgr, _ = get_controller_inputs()
 
             # Brainco open/close whenever the driver is alive (including OFF / smoke test).
+            # Freeze hands in POSE_PAUSE (Y): keep last gripper targets, ignore triggers.
             # Only force-open on emergency stop / process shutdown.
-            if brainco_hand is not None:
+            if brainco_hand is not None and current_mode != StreamMode.POSE_PAUSE:
                 update_brainco_from_triggers(
                     brainco_hand, left_trigger_mgr, right_trigger_mgr
                 )
@@ -2008,11 +2076,11 @@ def run_pico_manager(
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
 
-            # Rising edge: right B alone toggles POSE <-> POSE_PAUSE.
-            # Exclude: B+Y (frozen planner), left-grip+B (discard episode), A+B+X+Y.
+            # Rising edge: right Y alone toggles POSE <-> POSE_PAUSE.
+            # Exclude: B+Y (frozen planner), A+X, A+B+X+Y, left-grip combos.
             pose_pause_btn = (
-                bool(b_pressed)
-                and not bool(y_pressed)
+                bool(y_pressed)
+                and not bool(b_pressed)
                 and not bool(a_pressed)
                 and not bool(x_pressed)
                 and left_grip_mgr <= 0.5
@@ -2137,6 +2205,17 @@ def run_pico_manager(
                     socket.send(build_command_message(start=True, stop=False, planner=False))
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
+                # Announce on pico AudioClient (exporter TTS often unavailable when
+                # pico already owns DDS voice). Whitelist matches exporter.
+                _STREAM_MODE_TTS = {
+                    StreamMode.OFF: "模式关闭",
+                    StreamMode.POSE: "进入遥操模式",
+                    StreamMode.PLANNER: "进入规划模式",
+                    StreamMode.POSE_PAUSE: "遥操暂停",
+                }
+                tts_text = _STREAM_MODE_TTS.get(new_mode)
+                if tts_text is not None:
+                    robot_say(audio_client, tts_text)
                 current_mode = new_mode
 
             # Mode-independent: send manager_state for data exporter
@@ -2150,6 +2229,10 @@ def run_pico_manager(
                 pack_pose_message(
                     {
                         "stream_mode": np.array([current_mode.value], dtype=np.int32),
+                        # Planner locomotion mode (fixed SLOW_WALK); exporter may TTS on change.
+                        "locomotion_mode": np.array(
+                            [int(planner_streamer.mode.value)], dtype=np.int32
+                        ),
                         "toggle_data_collection": np.array([toggle_dc], dtype=bool),
                         "toggle_data_abort": np.array([toggle_da], dtype=bool),
                     },
