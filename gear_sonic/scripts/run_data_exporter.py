@@ -788,9 +788,13 @@ class GrootDataCollector:
                 say=False,
             )
             return False
-
+        # 只有当 EpisodeState 为 RECORDING 时才会真正写入数据。否则直接跳到 _finalize_frame（处理保存逻辑）。
         if self._episode_state.get_state() != self._episode_state.RECORDING:
             return self._finalize_frame(t_start)
+
+        # stream_mode 4 (POSE_PAUSE): 暂停时不写入帧，数据源继续轮询，恢复后直接接着写
+        if self.current_stream_mode == 4:
+            return True
 
         return self._add_data_frame_sonic(t_start)
 
@@ -1130,7 +1134,7 @@ class GrootDataCollector:
                         img_msg = self._image_subscriber.read()
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
-
+                    # 帧写入
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
 
