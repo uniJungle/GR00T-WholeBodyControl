@@ -205,9 +205,8 @@ def _create_robot_audio_client(dds_interface: str, init_channel_factory: bool = 
     client.SetVolume(100)
     code, _ = client.SetVoiceMode(3)
     print(f"[Audio] Voice mode set to 3 (code={code})")
-    # Smoke test so startup proves the robot speaker path works.
-    tts_code = client.TtsMaker("数据录制已就绪", 0)
-    print(f"[Audio] Startup TtsMaker code={tts_code}")
+    # Do not smoke-test TTS here: conflicts with robot base UI / other AudioClient users.
+    # Recording phrases (开始录制 / 保存 / 丢弃) still use this client later.
     return client
 
 
@@ -458,12 +457,12 @@ class GrootDataCollector:
         except Exception as e:
             print(f"[Audio] TtsMaker('{text}') failed: {e}")
 
-    # Matches pico_manager StreamMode. Only these modes are spoken on the robot.
+    # Matches pico_manager StreamMode. Log-only here; pico speaks on the robot.
     # 3 (PLANNER_FROZEN_UPPER_BODY) / 5 (PLANNER_VR_3PT) intentionally omitted.
     _STREAM_MODE_TTS = {
         0: "模式关闭",           # OFF
         1: "进入遥操模式",       # POSE (A+X)
-        2: "进入规划模式",       # PLANNER (A+X)
+        2: "进入规划模式",       # PLANNER (A+X / pico disconnect)
         4: "遥操暂停",           # POSE_PAUSE (tap right Y)
     }
 
@@ -477,7 +476,10 @@ class GrootDataCollector:
             return
         prev = self._last_announced_stream_mode
         self._last_announced_stream_mode = mode
-        text = self._STREAM_MODE_TTS.get(mode)
+        if mode == 1 and prev == 4:
+            text = "遥操返回"
+        else:
+            text = self._STREAM_MODE_TTS.get(mode)
         if text is None:
             print(f"[Mode] stream_mode {prev} -> {mode}: (no TTS, pico owns voice)")
             return

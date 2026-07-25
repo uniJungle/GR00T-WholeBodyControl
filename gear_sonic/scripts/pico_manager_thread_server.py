@@ -627,10 +627,14 @@ TRIGGER_DEADZONE = 0.05
 # Body-tracking gaps of 1–2s are common on Pico reconnect / tracking hitch;
 # only treat sustained loss as a disconnect. Shorter flaps must not yank POSE→PLANNER.
 PICO_STALE_SEC = 2.5
-PICO_SAFETY_TTS = "PICO断开，进入待机模式"
-PICO_SAFETY_TTS_COOLDOWN_SEC = 12.0
 PICO_SAFETY_GRACE_SEC = 3.0
 PICO_SAFETY_RESTORE_GRACE_SEC = 2.5
+# Mode TTS (single source with exporter._STREAM_MODE_TTS semantics).
+STREAM_MODE_TTS_PLANNER = "进入规划模式"
+STREAM_MODE_TTS_POSE = "进入遥操模式"
+STREAM_MODE_TTS_POSE_PAUSE = "遥操暂停"
+STREAM_MODE_TTS_POSE_RESUME = "遥操返回"
+STREAM_MODE_TTS_OFF = "模式关闭"
 
 
 @dataclass
@@ -639,13 +643,13 @@ class PicoSafetyWatchdog:
 
     Arms only after at least one fresh sample while not OFF. Requires the latest
     body sample to be older than ``PICO_STALE_SEC`` (outside a grace window)
-    before entering safety IDLE. TTS is rate-limited; flaps during grace are ignored.
+    before entering safety IDLE. Announcements are handled by mode-switch TTS
+    (``进入规划模式``), not a separate disconnect phrase.
     """
 
     armed: bool = False
     in_safety: bool = False
     grace_until: float = 0.0
-    last_tts_monotonic: float = 0.0
 
     def begin_grace(self, seconds: float) -> None:
         self.grace_until = max(self.grace_until, time.monotonic() + max(0.0, seconds))
@@ -692,12 +696,17 @@ class PicoSafetyWatchdog:
         self.in_safety = True
         return True, entered, False
 
-    def maybe_speak(self, audio_client) -> None:
-        now = time.monotonic()
-        if now - self.last_tts_monotonic < PICO_SAFETY_TTS_COOLDOWN_SEC:
-            return
-        self.last_tts_monotonic = now
-        robot_say(audio_client, PICO_SAFETY_TTS)
+
+def stream_mode_tts_text(new_mode: "StreamMode", current_mode: "StreamMode") -> str | None:
+    """TTS phrase for a stream-mode transition (A+X / Y / safety→planner)."""
+    if new_mode == StreamMode.POSE and current_mode == StreamMode.POSE_PAUSE:
+        return STREAM_MODE_TTS_POSE_RESUME
+    return {
+        StreamMode.OFF: STREAM_MODE_TTS_OFF,
+        StreamMode.POSE: STREAM_MODE_TTS_POSE,
+        StreamMode.PLANNER: STREAM_MODE_TTS_PLANNER,
+        StreamMode.POSE_PAUSE: STREAM_MODE_TTS_POSE_PAUSE,
+    }.get(new_mode)
 
 
 def _is_pico_stream_stale(reader: "PicoReader") -> bool:
@@ -723,13 +732,14 @@ def _send_planner_idle_burst(socket, count: int = 5) -> None:
 
 
 def _send_deploy_safety_handoff(socket, audio_client=None, *, tts: bool = True) -> None:
-    """Tell deploy to leave STREAMED_MOTION and hold standard IDLE (pico exit / kill)."""
+    """Tell deploy to leave STREAMED_MOTION and hold PLANNER IDLE (pico exit / kill)."""
     print("[Manager] Deploy handoff -> PLANNER + IDLE")
     socket.send(build_command_message(start=True, stop=False, planner=True))
     time.sleep(0.05)
     _send_planner_idle_burst(socket, count=10)
     if tts and audio_client is not None:
-        robot_say(audio_client, PICO_SAFETY_TTS)
+        # Same phrase as A+X → planner / unexpected disconnect mode switch.
+        robot_say(audio_client, STREAM_MODE_TTS_PLANNER)
     time.sleep(0.15)
 
 
@@ -2290,10 +2300,10 @@ def run_pico_manager(
             if entered_safety:
                 print(
                     f"[Manager] WARNING: Pico stream lost "
-                    f"(>{PICO_STALE_SEC:.1f}s) — safety IDLE."
+                    f"(>{PICO_STALE_SEC:.1f}s) — safety IDLE / PLANNER."
                 )
                 planner_streamer.enter_safety_idle()
-                pico_watchdog.maybe_speak(audio_client)
+                # TTS: mode switch below speaks「进入规划模式」(same as A+X).
 
             if pico_restored:
                 print("[Manager] Pico stream restored.")
@@ -2388,16 +2398,9 @@ def run_pico_manager(
                     socket.send(build_command_message(start=True, stop=False, planner=False))
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
-                # Announce on pico AudioClient (exporter TTS often unavailable when
-                # pico already owns DDS voice). Whitelist matches exporter.
-                _STREAM_MODE_TTS = {
-                    StreamMode.OFF: "模式关闭",
-                    StreamMode.POSE: "进入遥操模式",
-                    StreamMode.PLANNER: "进入规划模式",
-                    StreamMode.POSE_PAUSE: "遥操暂停",
-                }
-                tts_text = _STREAM_MODE_TTS.get(new_mode)
-                if tts_text is not None and not pico_missing:
+                # Single voice path for mode changes (A+X / Y pause-resume / safety→planner).
+                tts_text = stream_mode_tts_text(new_mode, current_mode)
+                if tts_text is not None:
                     robot_say(audio_client, tts_text)
                 current_mode = new_mode
 
