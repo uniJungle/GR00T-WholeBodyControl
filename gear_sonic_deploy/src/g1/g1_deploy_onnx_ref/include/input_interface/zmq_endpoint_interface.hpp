@@ -581,7 +581,14 @@ public:
     }
 
     std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const override {
-      if (is_localhost_) {
+      // Protocol v4 (token-only) never writes data_timestamp_ (that is for
+      // streamed MotionSequence). Prefer the latest of motion timestamp and
+      // raw receive time so localhost token replay is not treated as dead.
+      if (data_timestamp_.has_value() && last_receive_time_.has_value()) {
+        return (*data_timestamp_ > *last_receive_time_) ? data_timestamp_
+                                                        : last_receive_time_;
+      }
+      if (data_timestamp_.has_value()) {
         return data_timestamp_;
       }
       return last_receive_time_;

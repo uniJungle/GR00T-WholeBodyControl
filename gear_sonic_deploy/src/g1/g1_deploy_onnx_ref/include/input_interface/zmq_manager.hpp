@@ -29,6 +29,12 @@
  * automatically resets the locomotion to IDLE and clears upper-body / hand-joint
  * control flags.
  *
+ * ## Stream Timeout (publisher disconnect)
+ *
+ * If in STREAMED_MOTION and no pose frame arrives within 1 second (e.g. pico_manager
+ * killed), auto-switch to PLANNER + IDLE so the robot does not freeze on the last
+ * teleop frame.
+ *
  * ## Keyboard Shortcuts (via stdin)
  *
  *   Key  | Action
@@ -266,6 +272,7 @@ class ZMQManager : public InputInterface {
             } else if (new_mode == ManagedMode::STREAMED_MOTION) {
               std::cout << "[ZMQManager] Switched to: STREAMED MOTION mode (safety reset)" << std::endl;
               trigger_zmq_toggle = true;
+              stream_timeout_latched_ = false;
 
               // Clear planner buffer when switching away from planner mode
               {
@@ -368,9 +375,74 @@ class ZMQManager : public InputInterface {
                           heading_state_buffer,
                           has_planner, planner_state, movement_state_buffer,
                           current_motion_mutex);
-      } else {
-        // Streamed motion mode: delegate to pose interface
-        if (pose_interface_) {
+      } else if (pose_interface_) {
+        // Streamed motion: detect publisher disconnect. A deliberate POSE_PAUSE
+        // stops pose frames but keeps sending streamed-mode command heartbeats.
+        constexpr auto STREAM_TIMEOUT = std::chrono::milliseconds(1000);
+        auto last_update = pose_interface_->GetLastUpdateTime();
+        bool stream_stale = false;
+        auto newest_update = last_update;
+        {
+          std::lock_guard<std::mutex> lock(command_mutex_);
+          if (last_stream_heartbeat_.has_value() &&
+              (!newest_update.has_value() ||
+               *last_stream_heartbeat_ > *newest_update)) {
+            newest_update = last_stream_heartbeat_;
+          }
+        }
+        if (newest_update.has_value()) {
+          auto age = std::chrono::steady_clock::now() - *newest_update;
+          stream_stale = age >= STREAM_TIMEOUT;
+        }
+
+        if (stream_stale && operator_state.start) {
+          if (!stream_timeout_latched_) {
+            std::cout << "[ZMQManager] Stream timeout — publisher disconnected, "
+                      << "switching to PLANNER + IDLE" << std::endl;
+            stream_timeout_latched_ = true;
+          }
+
+          TriggerSafetyReset();
+          pose_interface_->TriggerSafetyReset();
+          active_mode_ = ManagedMode::PLANNER;
+
+          {
+            std::lock_guard<std::mutex> lock(planner_mutex_);
+            latest_planner_message_.valid = false;
+            latest_planner_message_.timestamp = {};
+            switch_from_teleop_to_planner_ = true;
+          }
+          has_upper_body_control_ = false;
+          has_hand_joints_ = false;
+          has_vr_3point_control_ = false;
+
+          std::array<double, 3> current_facing = {1.0, 0.0, 0.0};
+          auto facing_ptr = movement_state_buffer.GetDataWithTime().data;
+          if (facing_ptr) {
+            current_facing = facing_ptr->facing_direction;
+          }
+          movement_state_buffer.SetData(MovementState(
+            static_cast<int>(LocomotionMode::IDLE),
+            {0.0, 0.0, 0.0},
+            current_facing,
+            -1.0,
+            -1.0
+          ));
+
+          if (has_planner && !planner_state.enabled) {
+            planner_state.enabled = true;
+          }
+          is_planner_ready_ = planner_state.enabled && planner_state.initialized;
+
+          handlePlannerInput(motion_reader, current_motion, current_frame,
+                            operator_state, reinitialize_heading,
+                            heading_state_buffer,
+                            has_planner, planner_state, movement_state_buffer,
+                            current_motion_mutex);
+        } else {
+          if (last_update.has_value()) {
+            stream_timeout_latched_ = false;
+          }
           pose_interface_->handle_input(motion_reader, current_motion, current_frame,
                                        operator_state, reinitialize_heading,
                                        heading_state_buffer,
@@ -759,6 +831,11 @@ class ZMQManager : public InputInterface {
       latest_command_.stop = latest_command_.stop || cmd.stop;
       latest_command_.planner = cmd.planner;  // Overwrite (mode should be latest)
       latest_command_.valid = true;
+      if (!cmd.planner) {
+        // Also acts as the liveness heartbeat during intentional POSE_PAUSE,
+        // where pose frames are deliberately frozen.
+        last_stream_heartbeat_ = std::chrono::steady_clock::now();
+      }
       
       if constexpr (DEBUG_LOGGING) {
         std::cout << "[ZMQManager] Command received: start=" << cmd.start 
@@ -1252,6 +1329,12 @@ class ZMQManager : public InputInterface {
     /// Tracks the previous frame's VR-3-point state to detect enable/disable transitions
     /// and automatically toggle encoder mode accordingly.
     bool last_has_vr_3point_control_ = false;
+
+    /// Latched after stream timeout to avoid log spam while holding IDLE planner.
+    bool stream_timeout_latched_ = false;
+
+    /// Last streamed-mode command heartbeat; guarded by command_mutex_.
+    std::optional<std::chrono::steady_clock::time_point> last_stream_heartbeat_;
 };
 
 #endif // ZMQ_MANAGER_HPP

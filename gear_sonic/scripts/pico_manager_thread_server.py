@@ -23,6 +23,7 @@
 """
 
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 import json
 import os
@@ -623,6 +624,114 @@ def get_controller_inputs():
 
 
 TRIGGER_DEADZONE = 0.05
+# Body-tracking gaps of 1–2s are common on Pico reconnect / tracking hitch;
+# only treat sustained loss as a disconnect. Shorter flaps must not yank POSE→PLANNER.
+PICO_STALE_SEC = 2.5
+PICO_SAFETY_TTS = "PICO断开，进入待机模式"
+PICO_SAFETY_TTS_COOLDOWN_SEC = 12.0
+PICO_SAFETY_GRACE_SEC = 3.0
+PICO_SAFETY_RESTORE_GRACE_SEC = 2.5
+
+
+@dataclass
+class PicoSafetyWatchdog:
+    """Debounced Pico body-stream watchdog.
+
+    Arms only after at least one fresh sample while not OFF. Requires the latest
+    body sample to be older than ``PICO_STALE_SEC`` (outside a grace window)
+    before entering safety IDLE. TTS is rate-limited; flaps during grace are ignored.
+    """
+
+    armed: bool = False
+    in_safety: bool = False
+    grace_until: float = 0.0
+    last_tts_monotonic: float = 0.0
+
+    def begin_grace(self, seconds: float) -> None:
+        self.grace_until = max(self.grace_until, time.monotonic() + max(0.0, seconds))
+
+    def reset_session(self) -> None:
+        """Call when returning to OFF / shutting down manager control."""
+        self.armed = False
+        self.in_safety = False
+        self.grace_until = 0.0
+
+    def update(self, reader: "PicoReader", *, active: bool) -> tuple[bool, bool, bool]:
+        """
+        Returns:
+            pico_missing: stream currently considered lost (sustained)
+            entered_safety: rising edge into safety this tick
+            restored: rising edge out of safety this tick
+        """
+        now = time.monotonic()
+        sample = reader.get_latest()
+        age = None if sample is None else (now - float(sample["timestamp_monotonic"]))
+        sample_stale = sample is None or age > PICO_STALE_SEC
+
+        if not active:
+            # Stay quiet in OFF so ABXY start is not polluted by pre-start gaps.
+            if self.in_safety:
+                self.in_safety = False
+            return False, False, False
+
+        if not sample_stale:
+            self.armed = True
+            was_in_safety = self.in_safety
+            if was_in_safety:
+                self.in_safety = False
+                self.begin_grace(PICO_SAFETY_RESTORE_GRACE_SEC)
+                return False, False, True
+            return False, False, False
+
+        # Sample is already older than PICO_STALE_SEC (or never arrived).
+        if now < self.grace_until or not self.armed:
+            # Still report prior safety latch so we keep forcing PLANNER if needed.
+            return self.in_safety, False, False
+
+        entered = not self.in_safety
+        self.in_safety = True
+        return True, entered, False
+
+    def maybe_speak(self, audio_client) -> None:
+        now = time.monotonic()
+        if now - self.last_tts_monotonic < PICO_SAFETY_TTS_COOLDOWN_SEC:
+            return
+        self.last_tts_monotonic = now
+        robot_say(audio_client, PICO_SAFETY_TTS)
+
+
+def _is_pico_stream_stale(reader: "PicoReader") -> bool:
+    """True when body-tracking samples stopped (headset kill / stream drop)."""
+    sample = reader.get_latest()
+    if sample is None:
+        return True
+    return (time.monotonic() - sample["timestamp_monotonic"]) > PICO_STALE_SEC
+
+
+def _send_planner_idle_burst(socket, count: int = 5) -> None:
+    """Send several IDLE planner frames (exit streamed pose, stand in place)."""
+    for _ in range(max(1, count)):
+        msg = build_planner_message(
+            LocomotionMode.IDLE.value,
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            speed=-1.0,
+            height=-1.0,
+        )
+        socket.send(msg)
+        time.sleep(0.02)
+
+
+def _send_deploy_safety_handoff(socket, audio_client=None, *, tts: bool = True) -> None:
+    """Tell deploy to leave STREAMED_MOTION and hold standard IDLE (pico exit / kill)."""
+    print("[Manager] Deploy handoff -> PLANNER + IDLE")
+    socket.send(build_command_message(start=True, stop=False, planner=True))
+    time.sleep(0.05)
+    _send_planner_idle_burst(socket, count=10)
+    if tts and audio_client is not None:
+        robot_say(audio_client, PICO_SAFETY_TTS)
+    time.sleep(0.15)
+
 
 
 def _apply_trigger_deadzone(value: float, deadzone: float = TRIGGER_DEADZONE) -> float:
@@ -1784,16 +1893,32 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
         self.audio_client = audio_client
+        self._force_idle = False
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
+        self._force_idle = False
         self.yaw_accumulator.reset()
         self.mode = LocomotionMode.SLOW_WALK
         # Stream-mode TTS already says「进入规划模式」; skip「进入慢走模式」.
         print(f"[PlannerLoop] Mode locked -> {self.mode.value}: {self.mode.name}")
+
+    def enter_safety_idle(self):
+        """Pico stream lost: stand still in standard IDLE locomotion."""
+        self._force_idle = True
+        self.yaw_accumulator.reset()
+        self.mode = LocomotionMode.IDLE
+        print(f"[PlannerLoop] Safety -> {self.mode.value}: {self.mode.name}")
+
+    def restore_planner_locomotion(self):
+        """Pico stream restored while staying in PLANNER stream mode."""
+        if self._force_idle:
+            self._force_idle = False
+            self.mode = LocomotionMode.SLOW_WALK
+            print(f"[PlannerLoop] Stream restored -> {self.mode.value}: {self.mode.name}")
 
     def save_upper_body_position_target(self):
         """Poll feedback and save upper body position target."""
@@ -1822,43 +1947,44 @@ class PlannerStreamer:
     def run_once(self, stream_mode: StreamMode):
         """Execute one iteration of the planner control loop."""
         try:
-            # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
             xrt_timestamp = xrt.get_time_stamp_ns()
-            if xrt_timestamp == self.last_xrt_timestamp:
-                return
+            xrt_stalled = xrt_timestamp == self.last_xrt_timestamp
             self.last_xrt_timestamp = xrt_timestamp
 
-            # Locomotion mode is fixed to SLOW_WALK; A+B / X+Y no longer cycle modes.
-            # (A+B+X+Y emergency stop is handled in the outer manager loop.)
-
-            # Read axes/joysticks to control movement, facing, speed and mode
             lx, ly, rx, ry = get_controller_axes()
 
-            # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
-            facing = self.yaw_accumulator.update(rx, self.dt)
-
-            raw_mag = np.hypot(lx, ly)
-            raw_mag = np.clip(raw_mag, 0.0, 1.0)
-            if np.abs(raw_mag) < JOYSTICK_DEADZONE:
-                mag = 0.0
-                speed = -1.0
-                # Stick released: send IDLE so the robot stands still.
+            if self._force_idle or xrt_stalled:
+                lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
+                facing = self.yaw_accumulator.update(0.0, self.dt)
                 mode_to_send = LocomotionMode.IDLE
+                speed = -1.0
+                movement = [0.0, 0.0, 0.0]
             else:
-                mag = (raw_mag - JOYSTICK_DEADZONE) / (1.0 - JOYSTICK_DEADZONE)
-                if mag > 1.0:
-                    mag = 1.0
-                mode_to_send = LocomotionMode.SLOW_WALK
-                speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
+                # Facing from RIGHT stick: continuous yaw based on rx
+                facing = self.yaw_accumulator.update(rx, self.dt)
 
-            denom = raw_mag if raw_mag > 0.0 else 1.0
-            scale = mag / denom
-            movement_local = np.array([-lx, ly]) * scale
-            perp_x, perp_y = -facing[1], facing[0]
-            rotation_facing = np.array([[perp_x, perp_y], [facing[0], facing[1]]])
-            movement_global = rotation_facing @ movement_local
+                raw_mag = np.hypot(lx, ly)
+                raw_mag = np.clip(raw_mag, 0.0, 1.0)
+                if np.abs(raw_mag) < JOYSTICK_DEADZONE:
+                    mag = 0.0
+                    speed = -1.0
+                    mode_to_send = LocomotionMode.IDLE
+                else:
+                    mag = (raw_mag - JOYSTICK_DEADZONE) / (1.0 - JOYSTICK_DEADZONE)
+                    if mag > 1.0:
+                        mag = 1.0
+                    mode_to_send = LocomotionMode.SLOW_WALK
+                    speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
 
-            movement = [movement_global[0], movement_global[1], 0.0]
+                denom = raw_mag if raw_mag > 0.0 else 1.0
+                scale = mag / denom
+                movement_local = np.array([-lx, ly]) * scale
+                perp_x, perp_y = -facing[1], facing[0]
+                rotation_facing = np.array([[perp_x, perp_y], [facing[0], facing[1]]])
+                movement_global = rotation_facing @ movement_local
+                movement = [movement_global[0], movement_global[1], 0.0]
+
+            self.mode = mode_to_send
 
             upper_body_position = None
             left_hand_position = None
@@ -2045,12 +2171,14 @@ def run_pico_manager(
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    pico_watchdog = PicoSafetyWatchdog()
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
         prev_pose_pause_btn = False
+        last_pause_heartbeat = 0.0
         while True:
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
@@ -2091,6 +2219,8 @@ def run_pico_manager(
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
+                    # Ignore brief body gaps while tracking settles after ABXY start.
+                    pico_watchdog.begin_grace(PICO_SAFETY_GRACE_SEC)
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
                     # Uses the current Pico SMPL frame + FK of all-zero body joints.
                     sample = reader.get_latest()
@@ -2148,10 +2278,64 @@ def run_pico_manager(
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
 
+            # Safety: sustained Pico body-stream loss → PLANNER + IDLE (debounced).
+            pico_missing, entered_safety, pico_restored = pico_watchdog.update(
+                reader,
+                active=(new_mode != StreamMode.OFF),
+            )
+
+            if pico_missing and new_mode != StreamMode.OFF:
+                new_mode = StreamMode.PLANNER
+
+            if entered_safety:
+                print(
+                    f"[Manager] WARNING: Pico stream lost "
+                    f"(>{PICO_STALE_SEC:.1f}s) — safety IDLE."
+                )
+                planner_streamer.enter_safety_idle()
+                pico_watchdog.maybe_speak(audio_client)
+
+            if pico_restored:
+                print("[Manager] Pico stream restored.")
+                if new_mode == StreamMode.PLANNER or current_mode == StreamMode.PLANNER:
+                    planner_streamer.restore_planner_locomotion()
+
+            if new_mode == StreamMode.OFF and current_mode != StreamMode.OFF:
+                pico_watchdog.reset_session()
+            elif new_mode == StreamMode.POSE and current_mode != StreamMode.POSE:
+                # Brief grace so mode-switch / calibration hitch does not yank back.
+                pico_watchdog.begin_grace(PICO_SAFETY_RESTORE_GRACE_SEC)
+
+            # POSE_PAUSE intentionally stops pose frames to freeze the robot and
+            # Brainco hands. Keep the STREAMED_MOTION control channel alive so
+            # deploy does not mistake this operator pause for a dead Pico.
+            if new_mode == StreamMode.POSE_PAUSE and not pico_missing:
+                now = time.monotonic()
+                if now - last_pause_heartbeat >= 0.2:
+                    socket.send(
+                        build_command_message(start=True, stop=False, planner=False)
+                    )
+                    last_pause_heartbeat = now
+
             # Handle mode transitions before running loop
             if new_mode != current_mode:
-                if current_mode == StreamMode.POSE:
+                if current_mode in (StreamMode.POSE, StreamMode.POSE_PAUSE):
                     pose_streamer.on_mode_exit()
+
+                # Exit streamed motion before planner takes over (avoid freezing last pose).
+                if (
+                    new_mode == StreamMode.PLANNER
+                    and current_mode
+                    in (
+                        StreamMode.POSE,
+                        StreamMode.POSE_PAUSE,
+                        StreamMode.PLANNER_VR_3PT,
+                        StreamMode.PLANNER_FROZEN_UPPER_BODY,
+                    )
+                ):
+                    socket.send(build_command_message(start=True, stop=False, planner=True))
+                    time.sleep(0.05)
+                    _send_planner_idle_burst(socket, count=5)
 
                 # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
@@ -2161,9 +2345,8 @@ def run_pico_manager(
                 if new_mode == StreamMode.POSE:
                     pose_streamer.reset_yaw()
                 elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
-                    # Only reset yaw when freshly entering PLANNER from POSE,
-                    # not when returning from VR_3PT sub-mode
-                    planner_streamer.reset_yaw()
+                    if not pico_missing:
+                        planner_streamer.reset_yaw()
                 elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                     if current_mode != StreamMode.PLANNER_VR_3PT:
                         # Freshly entering from POSE: reset yaw and grab initial targets
@@ -2214,7 +2397,7 @@ def run_pico_manager(
                     StreamMode.POSE_PAUSE: "遥操暂停",
                 }
                 tts_text = _STREAM_MODE_TTS.get(new_mode)
-                if tts_text is not None:
+                if tts_text is not None and not pico_missing:
                     robot_say(audio_client, tts_text)
                 current_mode = new_mode
 
@@ -2249,7 +2432,11 @@ def run_pico_manager(
     except KeyboardInterrupt:
         print("\nStopping manager...")
     finally:
-        # Cleanup resources
+        # Ctrl+C / kill pico_manager: deploy must receive planner+IDLE before socket closes.
+        try:
+            _send_deploy_safety_handoff(socket, audio_client, tts=True)
+        except Exception as exc:
+            print(f"[Manager] Deploy handoff on shutdown failed: {exc}")
         shutdown_brainco_hand(brainco_hand)
         reader.stop()
         three_point.close()
