@@ -292,8 +292,10 @@ class G1Deploy {
     // =========================================================================
     // Program state and last commanded actions
     // =========================================================================
+    // LowState from G1 PC1 (192.168.123.161) over DDS. Brief gaps are common;
+    // 500ms was too aggressive (standing robot dumps to damping). Experiment: 3s.
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
-    static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
+    static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{1000};
     ProgramState program_state_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
@@ -2800,8 +2802,13 @@ class G1Deploy {
       }
 
       auto now = std::chrono::steady_clock::now();
-      if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
-        std::cout << "[ERROR] Lost LowState data connection from robot!" << std::endl;
+      const auto age = now - low_state_data.timestamp;
+      if (age > LOW_STATE_ABSENT_THRESHOLD) {
+        const double age_ms =
+            std::chrono::duration_cast<std::chrono::microseconds>(age).count() / 1000.0;
+        std::cout << "[ERROR] Lost LowState data connection from robot! "
+                  << "age=" << age_ms << "ms (threshold="
+                  << LOW_STATE_ABSENT_THRESHOLD.count() << "ms)" << std::endl;
         return false;
       }
 

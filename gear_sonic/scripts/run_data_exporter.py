@@ -205,8 +205,6 @@ def _create_robot_audio_client(dds_interface: str, init_channel_factory: bool = 
     client.SetVolume(100)
     code, _ = client.SetVoiceMode(3)
     print(f"[Audio] Voice mode set to 3 (code={code})")
-    # Do not smoke-test TTS here: conflicts with robot base UI / other AudioClient users.
-    # Recording phrases (开始录制 / 保存 / 丢弃) still use this client later.
     return client
 
 
@@ -394,22 +392,39 @@ class GrootDataCollector:
 
         self._sonic_zmq_ctx = None
         self._sonic_zmq_socket = None
+        self._manager_zmq_socket = None
         try:
             self._sonic_zmq_ctx = zmq.Context()
+            endpoint = f"tcp://{sonic_data_zmq_host}:{sonic_data_zmq_port}"
+
+            # pose/planner can be high-rate; keep a modest queue for latest motion.
             self._sonic_zmq_socket = self._sonic_zmq_ctx.socket(zmq.SUB)
-            self._sonic_zmq_socket.connect(f"tcp://{sonic_data_zmq_host}:{sonic_data_zmq_port}")
+            self._sonic_zmq_socket.connect(endpoint)
             self._sonic_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
             self._sonic_zmq_socket.setsockopt(zmq.CONFLATE, 0)
-            self._sonic_zmq_socket.setsockopt(zmq.RCVHWM, 20)
+            self._sonic_zmq_socket.setsockopt(zmq.RCVHWM, 200)
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
-            self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+
+            # manager_state must NOT share the pose queue: after POSE_PAUSE→POSE,
+            # pose flood used to drop mode=1 updates and leave exporter stuck at
+            # mode=4. Dedicated socket keeps control messages reliable.
+            # Do NOT use CONFLATE here: toggle_data_* are one-frame rising edges;
+            # CONFLATE would overwrite True with later False and lose grip+A/B.
+            self._manager_zmq_socket = self._sonic_zmq_ctx.socket(zmq.SUB)
+            self._manager_zmq_socket.connect(endpoint)
+            self._manager_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
+            self._manager_zmq_socket.setsockopt(zmq.CONFLATE, 0)
+            self._manager_zmq_socket.setsockopt(zmq.RCVHWM, 200)
+            self._manager_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
+
             time.sleep(0.5)
-            print(f"[Sonic] Connected to ZMQ at {sonic_data_zmq_host}:{sonic_data_zmq_port}")
-            print("[Sonic] Subscribed to: pose, planner, manager_state")
+            print(f"[Sonic] Connected to ZMQ at {endpoint}")
+            print("[Sonic] Subscribed to: pose, planner (data) + manager_state (control)")
         except Exception as e:
             print(f"[Sonic] Warning: Failed to initialize ZMQ subscriber: {e}")
             self._sonic_zmq_socket = None
+            self._manager_zmq_socket = None
 
         self.telemetry = Telemetry(window_size=100)
         self.sonic_timing_monitor = TimingThresholdMonitor(
@@ -529,9 +544,16 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
-                self._print_and_say(
-                    f"Started recording {self.current_episode_index}", blocking=False
-                )
+                if self.latest_image_msg is None:
+                    self._print_and_say(
+                        f"Started recording {self.current_episode_index} "
+                        "(no camera yet — images will be blank until image server is up)",
+                        blocking=False,
+                    )
+                else:
+                    self._print_and_say(
+                        f"Started recording {self.current_episode_index}", blocking=False
+                    )
                 self._robot_say("开始录制")
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
@@ -539,29 +561,53 @@ class GrootDataCollector:
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "x":
-            if self._episode_state.get_state() == self._episode_state.RECORDING:
+            state = self._episode_state.get_state()
+            if state in (self._episode_state.RECORDING, self._episode_state.NEED_TO_SAVE):
                 discarded_idx = int(self.data_exporter.episode_buffer["episode_index"])
-                self.data_exporter.save_episode_as_discarded()
+                buffer_size = self.data_exporter.episode_buffer.get("size", 0)
+                if buffer_size > 0:
+                    self.data_exporter.save_episode_as_discarded()
+                else:
+                    self._print_and_say(
+                        "Discarded empty episode (no frames collected yet)",
+                        say=False,
+                    )
                 self._episode_state.reset_state()
                 self._initial_yaw = None
                 self._print_and_say("Discarded episode", blocking=False)
                 self._robot_say(f"丢弃第{discarded_idx + 1}条")
+            else:
+                self._print_and_say("Discard ignored: not recording", say=False)
 
     def _poll_sonic_zmq_messages(self):
-        """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""
+        """Poll ZMQ for manager_state, pose, and planner (non-blocking).
+
+        manager_state is on a dedicated socket so pause/resume mode updates are
+        never starved by high-rate pose frames. Drain the full control queue each
+        tick so one-frame toggle edges (grip+A/B) are not missed.
+        """
+        # 1) Control path first: drain all pending manager_state messages.
+        if self._manager_zmq_socket is not None:
+            for _ in range(64):
+                try:
+                    raw = self._manager_zmq_socket.recv(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                if raw.startswith(b"manager_state"):
+                    self._handle_manager_state(raw)
+
+        # 2) Motion path: drain a burst of pose/planner.
         if self._sonic_zmq_socket is None:
             return
 
-        max_polls = 20
+        max_polls = 40
         for _ in range(max_polls):
             try:
                 raw = self._sonic_zmq_socket.recv(zmq.NOBLOCK)
             except zmq.Again:
                 break
 
-            if raw.startswith(b"manager_state"):
-                self._handle_manager_state(raw)
-            elif raw.startswith(b"planner"):
+            if raw.startswith(b"planner"):
                 self._handle_planner_message(raw)
             elif raw.startswith(b"pose"):
                 self._handle_pose_message(raw)
@@ -706,6 +752,11 @@ class GrootDataCollector:
                 "frame_index": frame_index,
                 "receive_timestamp": time.time(),
             }
+            # pose topic is only published in POSE mode. If exporter was stuck at
+            # POSE_PAUSE (4) due to a dropped manager_state, clear it here.
+            if self.current_stream_mode == 4:
+                self.current_stream_mode = 1
+                self._announce_stream_mode(1)
         except Exception as e:
             if not hasattr(self, "_sonic_error_count"):
                 self._sonic_error_count = 0
@@ -743,19 +794,39 @@ class GrootDataCollector:
             if parts:
                 print(f"[Latency] {', '.join(parts)}")
 
+    def _blank_image_for_feature(self, feature_info: dict) -> np.ndarray:
+        """Black RGB frame matching feature shape (used when camera is down)."""
+        shape = feature_info.get("shape", [480, 640, 3])
+        h, w = int(shape[0]), int(shape[1])
+        c = int(shape[2]) if len(shape) > 2 else 3
+        return np.zeros((h, w, c), dtype=np.uint8)
+
     def _add_images_to_frame_data(self, frame_data: dict) -> None:
-        if self.latest_image_msg is None:
-            return
-        images = self.latest_image_msg["images"]
+        images = {}
+        if self.latest_image_msg is not None:
+            images = self.latest_image_msg.get("images") or {}
+
+        missing = []
         for feature_name, feature_info in self.data_exporter.features.items():
-            if feature_info.get("dtype") in ["image", "video"]:
-                image_key = feature_name.split(".")[-1]
-                if image_key not in images:
-                    raise ValueError(
-                        f"Required image '{image_key}' for feature '{feature_name}' "
-                        f"not found in image message. Available: {list(images.keys())}"
-                    )
+            if feature_info.get("dtype") not in ["image", "video"]:
+                continue
+            image_key = feature_name.split(".")[-1]
+            if image_key in images and images[image_key] is not None:
                 frame_data[feature_name] = images[image_key]
+            else:
+                frame_data[feature_name] = self._blank_image_for_feature(feature_info)
+                missing.append(image_key)
+
+        if missing:
+            now = time.monotonic()
+            last = getattr(self, "_last_blank_image_log", 0.0)
+            if now - last >= 2.0:
+                self._last_blank_image_log = now
+                self._print_and_say(
+                    f"[Camera] missing {missing} — writing blank frames "
+                    f"(other modalities still recorded)",
+                    say=False,
+                )
 
     def _finalize_frame(self, t_start: float) -> bool:
         t_end = time.monotonic()
@@ -782,19 +853,26 @@ class GrootDataCollector:
     def _add_data_frame(self):
         t_start = time.monotonic()
 
-        if self.latest_proprio_msg is None or self.latest_image_msg is None:
-            self._print_and_say(
-                f"Waiting for message. "
-                f"Avail msg: proprio {self.latest_proprio_msg is not None} | "
-                f"image {self.latest_image_msg is not None}",
-                say=False,
-            )
-            return False
-        # 只有当 EpisodeState 为 RECORDING 时才会真正写入数据。否则直接跳到 _finalize_frame（处理保存逻辑）。
+        # Stop/save path does not need live camera frames.
         if self._episode_state.get_state() != self._episode_state.RECORDING:
             return self._finalize_frame(t_start)
 
-        # stream_mode 4 (POSE_PAUSE): 暂停时不写入帧，数据源继续轮询，恢复后直接接着写
+        # Proprio is required; images may be blank placeholders if camera is down.
+        if self.latest_proprio_msg is None:
+            now = time.monotonic()
+            last = getattr(self, "_last_waiting_msg_log", 0.0)
+            if now - last >= 2.0:
+                self._last_waiting_msg_log = now
+                self._print_and_say(
+                    "Waiting for proprio (g1_debug). "
+                    f"image_available={self.latest_image_msg is not None}",
+                    say=False,
+                )
+            return False
+
+        # stream_mode 4 (POSE_PAUSE): skip frame writes during pause; resume
+        # immediately when mode returns to POSE (1). Keep polling so save/discard
+        # and mode updates still work.
         if self.current_stream_mode == 4:
             return True
 
@@ -1106,7 +1184,7 @@ class GrootDataCollector:
             self._state_subscriber.close()
         except Exception:
             pass
-        for sock in [self._sonic_zmq_socket]:
+        for sock in [self._manager_zmq_socket, self._sonic_zmq_socket]:
             if sock is not None:
                 try:
                     sock.close()
