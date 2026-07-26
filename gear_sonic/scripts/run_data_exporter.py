@@ -16,12 +16,15 @@ Virtual environment setup (run from repo root):
 
 Usage (from repo root):
     python gear_sonic/scripts/run_data_exporter.py --task-prompt "pick up the cup"
-    python gear_sonic/scripts/run_data_exporter.py --task-prompt "walk forward" --dataset-name my_session
+    python gear_sonic/scripts/run_data_exporter.py --task-prompt "walk forward" --task-name pour
+    # Optional session subdir: --dataset-name my_session
+    #   -> <root>/<task_name>/<dataset_name>/
+    # Default (no --dataset-name):
+    #   -> <root>/<task_name>/
 """
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
 import json
 import time
 
@@ -84,7 +87,8 @@ class SonicDataExporterConfig:
 
     # Dataset
     dataset_name: str | None = None
-    """Dataset name (auto-generated if creating new)."""
+    """Optional subdirectory under task_name. If None, save directly to
+    ``<root_output_dir>/<task_name>/`` (no date folder)."""
 
     task_name: str = "default_task"
     """Task specific directory name."""
@@ -1283,8 +1287,13 @@ def main(config: SonicDataExporterConfig):
         config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
     )
 
+    if config.dataset_name:
+        save_root = f"{config.root_output_dir}/{config.task_name}/{config.dataset_name}"
+    else:
+        save_root = f"{config.root_output_dir}/{config.task_name}"
+
     data_exporter = Gr00tDataExporter.create(
-        save_root=f"{config.root_output_dir}/{config.task_name}/{config.dataset_name}",
+        save_root=save_root,
         fps=config.data_collection_frequency,
         features=dataset_features,
         modality_config=modality_config,
@@ -1312,8 +1321,4 @@ def main(config: SonicDataExporterConfig):
 
 if __name__ == "__main__":
     config = tyro.cli(SonicDataExporterConfig)
-
-    if config.dataset_name is None:
-        config.dataset_name = datetime.now().strftime("%Y-%m-%d")
-
     main(config)
