@@ -16,6 +16,7 @@ from datasets import load_dataset
 from datasets.utils import disable_progress_bars
 from huggingface_hub.errors import RepositoryNotFoundError
 from lerobot.common.datasets.lerobot_dataset import (
+    CODEBASE_VERSION,
     LeRobotDataset,
     LeRobotDatasetMetadata,
     compute_episode_stats,
@@ -93,13 +94,52 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
     """Additional metadata on top of LeRobotDatasetMetadata:
     - modality_config: Written to ``meta/modality.json``
     - discarded_episode_indices: Written to ``meta/info.json``
+
+    Local recording datasets must never contact HuggingFace Hub. Upstream
+    ``LeRobotDatasetMetadata`` falls back to Hub on any missing meta file,
+    which breaks offline resume when ``data/`` already exists.
     """
 
     MODALITY_CONFIG_REL_PATH = Path("meta/modality.json")
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        with open(self.root / self.MODALITY_CONFIG_REL_PATH, "rb") as f:
+    def __init__(
+        self,
+        repo_id: str,
+        root: str | Path | None = None,
+        revision: str | None = None,
+        force_cache_sync: bool = False,
+    ):
+        # Intentionally bypass LeRobotDatasetMetadata.__init__ Hub fallback.
+        self.repo_id = repo_id
+        self.revision = revision if revision else CODEBASE_VERSION
+        self.root = Path(root) if root is not None else Path(repo_id)
+        self.local_files_only = True
+
+        info_path = self.root / "meta" / "info.json"
+        modality_path = self.root / self.MODALITY_CONFIG_REL_PATH
+        if not info_path.is_file():
+            raise FileNotFoundError(
+                f"Local dataset meta missing: {info_path}. "
+                f"Cannot resume recording from {self.root} "
+                f"(found data/ alone is not enough). "
+                f"Delete this directory or pass overwrite_existing=True."
+            )
+        if not modality_path.is_file():
+            raise FileNotFoundError(
+                f"Local dataset modality config missing: {modality_path}. "
+                f"Cannot resume recording from {self.root}."
+            )
+
+        try:
+            self.load_metadata()
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"Incomplete local dataset at {self.root}: {e}. "
+                f"Delete this directory or pass overwrite_existing=True "
+                f"to start a new recording session."
+            ) from e
+
+        with open(modality_path, "rb") as f:
             self.modality_config = json.load(f)
 
     @classmethod
@@ -120,6 +160,7 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
             json.dump(obj.info, f, indent=4)
 
         obj.__class__ = cls
+        obj.local_files_only = True
         with open(obj.root / cls.MODALITY_CONFIG_REL_PATH, "w") as f:
             json.dump(modality_config, f, indent=4)
         obj.modality_config = modality_config
@@ -207,6 +248,17 @@ class Gr00tDataExporter(LeRobotDataset):
                     repo_id=repo_id,
                     root=save_root,
                 )
+                print(
+                    f"[Exporter] Resuming existing local dataset at {save_root} "
+                    f"(episodes={obj.meta.total_episodes}, frames={obj.meta.total_frames})"
+                )
+            except FileNotFoundError as e:
+                raise ValueError(
+                    f"Failed to resume local dataset at {save_root}: {e}\n"
+                    f"This directory exists but is missing required meta files "
+                    f"(offline resume never contacts HuggingFace). "
+                    f"Fix: remove the directory, or recreate with overwrite_existing=True."
+                ) from e
             except RepositoryNotFoundError as e:
                 raise ValueError(
                     f"Failed to resume from corrupted dataset. "

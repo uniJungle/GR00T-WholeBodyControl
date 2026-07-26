@@ -821,8 +821,6 @@ def create_robot_tts_client(
         client.SetVolume(100)
         mode_code, _ = client.SetVoiceMode(3)
         print(f"[Audio] VoiceMode=3 code={mode_code} iface={network_interface or 'default'}")
-        tts_code = client.TtsMaker("语音已就绪", 0)
-        print(f"[Audio] Startup TTS code={tts_code}")
         return client
     except Exception as e:
         print(f"[Audio] Failed to init robot TTS: {e}")
