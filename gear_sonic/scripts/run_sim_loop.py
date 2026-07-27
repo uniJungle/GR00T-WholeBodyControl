@@ -8,7 +8,7 @@ from typing import Dict
 
 import tyro
 
-from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
+from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory
 from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
 from gear_sonic.data.robot_model.instantiation.g1 import (
     instantiate_g1_robot_model,
@@ -23,7 +23,7 @@ class SimWrapper:
         self.robot_model = robot_model
         self.config = config
 
-        init_channel(config=self.config)
+        # DDS is initialized once inside BaseSimulator.
 
         # Create simulator using factory
         self.sim = SimulatorFactory.create_simulator(
