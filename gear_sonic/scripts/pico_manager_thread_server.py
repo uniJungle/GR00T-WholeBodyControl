@@ -2402,11 +2402,15 @@ def run_pico_manager(
                     robot_say(audio_client, tts_text)
                 current_mode = new_mode
 
-            # Mode-independent: send manager_state for data exporter
+            # manager_state always carries stream_mode; record toggles only in teleop (POSE).
+            # Planner / VR3PT / frozen / OFF must not start/save/discard episodes via grip+A/B.
             toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
             toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
-            toggle_dc = toggle_dc_tmp and not prev_toggle_dc
-            toggle_da = toggle_da_tmp and not prev_toggle_da
+            in_teleop = current_mode == StreamMode.POSE
+            toggle_dc = in_teleop and toggle_dc_tmp and not prev_toggle_dc
+            toggle_da = in_teleop and toggle_da_tmp and not prev_toggle_da
+            # Track raw combos even outside POSE so a held grip+A across A+X does not
+            # fire a rising edge the moment teleop resumes.
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
             socket.send(

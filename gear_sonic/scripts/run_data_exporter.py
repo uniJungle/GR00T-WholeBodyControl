@@ -534,7 +534,11 @@ class GrootDataCollector:
         self.latest_proprio_msg = msg
 
     def _check_recording_commands(self):
-        """Check keyboard + ZMQ toggle flags for recording commands."""
+        """Check keyboard + ZMQ toggle flags for recording commands.
+
+        Start/stop/discard only apply in teleop (StreamMode.POSE). Planner-mode
+        grip+A/B must not save or discard episodes.
+        """
         key = self._keyboard_listener.read_msg()
 
         if self._manager_toggle_da:
@@ -543,6 +547,15 @@ class GrootDataCollector:
         elif self._manager_toggle_dc:
             key = "c"
             self._manager_toggle_dc = False
+
+        # Keyboard c/x is also teleop-gated so planner sessions cannot archive data.
+        in_teleop = int(getattr(self, "current_stream_mode", 0)) == 1
+        if key in ("c", "x") and not in_teleop:
+            self._print_and_say(
+                "Record/discard ignored: not in teleop (POSE) mode",
+                say=False,
+            )
+            return
 
         if key == "c":
             self._episode_state.change_state()
@@ -633,9 +646,12 @@ class GrootDataCollector:
             loco_mode = int(np.asarray(data["locomotion_mode"]).flat[0])
             self._announce_locomotion_mode(loco_mode)
 
-        if self._extract_bool(data, "toggle_data_collection"):
+        # Recording controls are teleop-only (StreamMode.POSE == 1). Ignore grip+A/B
+        # edges published while pico is in planner / pause / VR3PT / off.
+        in_teleop = int(getattr(self, "current_stream_mode", 0)) == 1
+        if in_teleop and self._extract_bool(data, "toggle_data_collection"):
             self._manager_toggle_dc = True
-        if self._extract_bool(data, "toggle_data_abort"):
+        if in_teleop and self._extract_bool(data, "toggle_data_abort"):
             self._manager_toggle_da = True
 
     def _handle_planner_message(self, raw: bytes) -> None:
