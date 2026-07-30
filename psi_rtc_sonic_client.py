@@ -7,6 +7,10 @@ import signal
 import struct
 from collections import deque
 
+# NOTE: For Brainco (33D state / 68D action) real-robot deployment, use
+# Psi0/real/deploy/psi_inference.py instead. This legacy client targets Dex3
+# (78D action) and RealSense REQ camera on :5558.
+
 import cv2
 import numpy as np
 import zmq
