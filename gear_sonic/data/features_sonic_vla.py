@@ -54,6 +54,11 @@ def get_modality_config_sonic_vla(robot_model: RobotModel, eef: str = "dex3") ->
         group_slices["left_hand"] = {"start": 29, "end": 31}
         group_slices["right_hand"] = {"start": 31, "end": 33}
         hand_dim = 2
+    elif eef == "dex1":
+        # Dex1 gripper: 1-dim per hand
+        group_slices["left_hand"] = {"start": 29, "end": 30}
+        group_slices["right_hand"] = {"start": 30, "end": 31}
+        hand_dim = 1
     else:
         hand_dim = 7
 
@@ -224,6 +229,14 @@ def get_features_sonic_vla(robot_model: RobotModel, eef: str = "dex3") -> dict:
         hand_dim = 2
         hand_names_left = ["left_hand_thumb_aux", "left_hand_others"]
         hand_names_right = ["right_hand_thumb_aux", "right_hand_others"]
+    elif eef == "dex1":
+        joint_names = robot_model.joint_names[:29] + [
+            "left_gripper", "right_gripper"
+        ]
+        num_joints = 31
+        hand_dim = 1
+        hand_names_left = ["left_gripper"]
+        hand_names_right = ["right_gripper"]
     else:
         joint_names = robot_model.joint_names
         num_joints = robot_model.num_joints

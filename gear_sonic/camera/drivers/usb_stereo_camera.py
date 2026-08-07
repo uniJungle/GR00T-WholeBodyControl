@@ -5,6 +5,8 @@ Many head-mounted stereo USB cameras expose a single UVC stream at 1280x480
 published as ``ego_view_left`` and ``ego_view_right``.
 """
 
+from __future__ import annotations
+
 import time
 from typing import Any
 

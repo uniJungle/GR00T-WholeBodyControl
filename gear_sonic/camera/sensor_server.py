@@ -1,5 +1,7 @@
 """ZMQ PUB/SUB transport and image serialisation for the camera server."""
 
+from __future__ import annotations
+
 import base64
 from dataclasses import dataclass, field
 from enum import Enum
@@ -118,7 +120,7 @@ class ImageMessageSchema:
     def serialize(self) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {"timestamps": self.timestamps, "images": {}}
         for key, image in self.images.items():
-            if isinstance(image, bytes | bytearray):
+            if isinstance(image, (bytes, bytearray)):
                 serialized_msg["images"][key] = image
             else:
                 serialized_msg["images"][key] = ImageUtils.encode_image(image)
@@ -129,7 +131,7 @@ class ImageMessageSchema:
         timestamps = data.get("timestamps", {})
         images = {}
         for key, value in data.get("images", {}).items():
-            if isinstance(value, bytes | bytearray):
+            if isinstance(value, (bytes, bytearray)):
                 mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
                 images[key] = mat[..., ::-1]  # BGR -> RGB
             elif isinstance(value, str):

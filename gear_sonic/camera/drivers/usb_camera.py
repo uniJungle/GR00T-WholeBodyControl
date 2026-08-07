@@ -4,6 +4,8 @@ No hardware SDK needed — works with any UVC-compatible camera visible as
 ``/dev/video*``.  Only requires ``opencv-python``.
 """
 
+from __future__ import annotations
+
 import time
 from typing import Any
 

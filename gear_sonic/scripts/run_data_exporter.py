@@ -144,7 +144,7 @@ class SonicDataExporterConfig:
     """Network interface connected to the robot (for Unitree DDS / AudioClient)."""
 
     eef: str = "dex3"
-    """End-effector driver: 'dex3' (7-dim) or 'brainco' (2-dim)."""
+    """End-effector driver: 'dex3' (7-dim), 'brainco' (2-dim), or 'dex1' (1-dim)."""
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +344,12 @@ class GrootDataCollector:
         self.data_exporter = data_exporter
         self.robot_model = robot_model
         self.eef = eef
-        self.hand_dim = 2 if eef == "brainco" else 7
+        if eef == "brainco":
+            self.hand_dim = 2
+        elif eef == "dex1":
+            self.hand_dim = 1
+        else:
+            self.hand_dim = 7
 
         # Unitree DDS ChannelFactory can only be initialized once per process.
         # Brainco passive monitor and G1 AudioClient both need it — init once here.
@@ -920,6 +925,25 @@ class GrootDataCollector:
                 ]
             )
             # FK for wrist pose only needs body joints; pad Dex3 hand slots with zeros.
+            fk_q = self.robot_model.get_configuration_from_actuated_joints(
+                body_actuated_joint_values=body_q,
+                left_hand_actuated_joint_values=np.zeros(7, dtype=np.float64),
+                right_hand_actuated_joint_values=np.zeros(7, dtype=np.float64),
+            )
+        elif self.eef == "dex1":
+            # Dex1 gripper: 1-dim per hand; FK still uses only body joints.
+            body_q = np.asarray(proprio["body_q"], dtype=np.float64).reshape(-1)
+            body_action = np.asarray(proprio["last_action"], dtype=np.float64).reshape(-1)
+            left_hand_q = np.asarray(proprio.get("left_hand_q", [0.0]), dtype=np.float64).reshape(-1)[:1]
+            right_hand_q = np.asarray(proprio.get("right_hand_q", [0.0]), dtype=np.float64).reshape(-1)[:1]
+            left_hand_action = np.asarray(
+                proprio.get("last_left_hand_action", left_hand_q), dtype=np.float64
+            ).reshape(-1)[:1]
+            right_hand_action = np.asarray(
+                proprio.get("last_right_hand_action", right_hand_q), dtype=np.float64
+            ).reshape(-1)[:1]
+            whole_q = np.concatenate([body_q, left_hand_q, right_hand_q])
+            whole_action_wbc = np.concatenate([body_action, left_hand_action, right_hand_action])
             fk_q = self.robot_model.get_configuration_from_actuated_joints(
                 body_actuated_joint_values=body_q,
                 left_hand_actuated_joint_values=np.zeros(7, dtype=np.float64),

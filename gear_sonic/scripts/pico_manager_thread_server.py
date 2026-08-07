@@ -92,6 +92,11 @@ except ImportError:
     Brainco = None
 
 try:
+    from eef.dex1.dex1 import Dex1
+except ImportError:
+    Dex1 = None
+
+try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
@@ -842,6 +847,8 @@ def robot_say(audio_client, text: str) -> None:
 
 
 _brainco_trigger_log_t = 0.0
+_dex1_trigger_log_t = 0.0
+DEX1_TRIGGER_SCALE = 5.5
 
 
 def update_brainco_from_triggers(hand, left_trigger: float, right_trigger: float) -> None:
@@ -859,6 +866,45 @@ def update_brainco_from_triggers(hand, left_trigger: float, right_trigger: float
         _brainco_trigger_log_t = now
 
 
+def _map_dex1_trigger(trigger_value: float) -> float:
+    """Map Pico trigger [0,1] to Dex1 gripper command."""
+    t = _apply_trigger_deadzone(trigger_value)
+    # Keep existing Dex1 convention from teleop runtime: inverse mapping * scale.
+    return (1.0 - t) * DEX1_TRIGGER_SCALE
+
+
+def create_dex1_hand(network_interface: str | None = None):
+    """Create an active Dex1 controller, or raise if unavailable."""
+    if Dex1 is None:
+        raise ImportError(
+            "Dex1 driver not available. Ensure eef.dex1 is installed "
+            "(pip install -e gear_sonic[teleop]) and dependencies are present."
+        )
+    print(
+        f"[Dex1] Initializing active gripper control "
+        f"(dds_interface={network_interface or 'default'})..."
+    )
+    hand = Dex1(network_interface=network_interface)
+    hand.set_gripper_ratios(0.0, 0.0)
+    print("[Dex1] Ready. Left/right trigger control gripper targets.")
+    return hand
+
+
+def update_dex1_from_triggers(hand, left_trigger: float, right_trigger: float) -> tuple[float, float]:
+    """Drive Dex1 grippers from Pico trigger values and return applied targets."""
+    if hand is None:
+        return 0.0, 0.0
+    l = _map_dex1_trigger(left_trigger)
+    r = _map_dex1_trigger(right_trigger)
+    hand.set_gripper_ratios(l, r)
+    global _dex1_trigger_log_t
+    now = time.time()
+    if (l > 0.0 or r > 0.0) and (now - _dex1_trigger_log_t) > 1.0:
+        print(f"[Dex1] cmd L={l:.2f} R={r:.2f}")
+        _dex1_trigger_log_t = now
+    return l, r
+
+
 def shutdown_brainco_hand(hand) -> None:
     """Open hands then stop DDS threads."""
     if hand is None:
@@ -873,6 +919,18 @@ def shutdown_brainco_hand(hand) -> None:
     except Exception as exc:
         print(f"[Brainco] Failed to close controller: {exc}")
     print("[Brainco] Shutdown complete")
+
+
+def shutdown_dex1_hand(hand) -> None:
+    """Best-effort shutdown for Dex1 controller."""
+    if hand is None:
+        return
+    try:
+        hand.set_gripper_ratios(0.0, 0.0)
+        time.sleep(0.1)
+    except Exception as exc:
+        print(f"[Dex1] Failed to reset gripper on shutdown: {exc}")
+    print("[Dex1] Shutdown complete")
 
 
 def get_controller_axes():
@@ -1434,6 +1492,7 @@ class PoseStreamer:
         use_cuda: bool,
         record_dir: str,
         record_format: str,
+        eef_mode: str = "none",
         log_prefix: str = "PoseLoop",
     ):
         self.socket = socket
@@ -1454,6 +1513,7 @@ class PoseStreamer:
         if record_dir:
             os.makedirs(record_dir, exist_ok=True)
         self.record_idx = 0
+        self.eef_mode = eef_mode
 
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
         self.parent_indices = [
@@ -1552,14 +1612,19 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
-            left_trigger,
-            left_grip,
-            right_trigger,
-            right_grip,
-        )
+        if self.eef_mode == "dex1":
+            # Dex1: 1-dim gripper command per hand
+            left_hand_joints = np.array([_map_dex1_trigger(left_trigger)], dtype=np.float32).reshape(1, 1)
+            right_hand_joints = np.array([_map_dex1_trigger(right_trigger)], dtype=np.float32).reshape(1, 1)
+        else:
+            left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+                self.left_hand_ik_solver,
+                self.right_hand_ik_solver,
+                left_trigger,
+                left_grip,
+                right_trigger,
+                right_grip,
+            )
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1885,6 +1950,7 @@ class PlannerStreamer:
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
         audio_client=None,
+        eef_mode: str = "none",
     ):
         self.socket = socket
         self.reader = reader
@@ -1901,6 +1967,7 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
         self.audio_client = audio_client
+        self.eef_mode = eef_mode
         self._force_idle = False
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
@@ -2022,14 +2089,18 @@ class PlannerStreamer:
                     left_grip,
                     right_grip,
                 ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
-                )
+                if self.eef_mode == "dex1":
+                    lh_joints = np.array([_map_dex1_trigger(left_trigger)], dtype=np.float32).reshape(1, 1)
+                    rh_joints = np.array([_map_dex1_trigger(right_trigger)], dtype=np.float32).reshape(1, 1)
+                else:
+                    lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                        self.left_hand_ik_solver,
+                        self.right_hand_ik_solver,
+                        left_trigger,
+                        left_grip,
+                        right_trigger,
+                        right_grip,
+                    )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
@@ -2097,15 +2168,18 @@ def run_pico_manager(
         time.sleep(1)
 
     brainco_hand = None
+    dex1_hand = None
     if eef == "brainco":
         brainco_hand = create_brainco_hand(network_interface=dds_interface or None)
+    elif eef == "dex1":
+        dex1_hand = create_dex1_hand(network_interface=dds_interface or None)
     elif eef not in ("", "none"):
-        raise ValueError(f"Unsupported --eef={eef!r}. Use 'none' or 'brainco'.")
+        raise ValueError(f"Unsupported --eef={eef!r}. Use 'none', 'brainco', or 'dex1'.")
 
-    # Share ChannelFactory with Brainco when already initialized.
+    # Share ChannelFactory with Brainco/Dex1 when already initialized.
     audio_client = create_robot_tts_client(
         dds_interface or None,
-        init_channel_factory=(brainco_hand is None),
+        init_channel_factory=(brainco_hand is None and dex1_hand is None),
     )
 
     context = zmq.Context()
@@ -2142,6 +2216,7 @@ def run_pico_manager(
         use_cuda=use_cuda,
         record_dir=record_dir,
         record_format=record_format,
+        eef_mode=eef,
         log_prefix="PoseLoop",
     )
     planner_streamer = PlannerStreamer(
@@ -2152,6 +2227,7 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
         audio_client=audio_client,
+        eef_mode=eef,
     )
 
     # State machine diagram:
@@ -2173,6 +2249,8 @@ def run_pico_manager(
     print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy, Y=toggle pose pause")
     if brainco_hand is not None:
         print("Brainco hands: left/right trigger = open/close")
+    if dex1_hand is not None:
+        print("Dex1 gripper: left/right trigger = gripper targets")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -2199,6 +2277,10 @@ def run_pico_manager(
             if brainco_hand is not None and current_mode != StreamMode.POSE_PAUSE:
                 update_brainco_from_triggers(
                     brainco_hand, left_trigger_mgr, right_trigger_mgr
+                )
+            if dex1_hand is not None and current_mode != StreamMode.POSE_PAUSE:
+                update_dex1_from_triggers(
+                    dex1_hand, left_trigger_mgr, right_trigger_mgr
                 )
 
             left_axis_click, _ = get_axis_clicks()
@@ -2385,6 +2467,8 @@ def run_pico_manager(
                     # Open hands before hard exit (finally also cleans up).
                     shutdown_brainco_hand(brainco_hand)
                     brainco_hand = None
+                    shutdown_dex1_hand(dex1_hand)
+                    dex1_hand = None
                     exit()
                 elif (
                     new_mode == StreamMode.PLANNER
@@ -2443,6 +2527,7 @@ def run_pico_manager(
         except Exception as exc:
             print(f"[Manager] Deploy handoff on shutdown failed: {exc}")
         shutdown_brainco_hand(brainco_hand)
+        shutdown_dex1_hand(dex1_hand)
         reader.stop()
         three_point.close()
         socket.close()
@@ -2538,9 +2623,10 @@ if __name__ == "__main__":
         "--eef",
         type=str,
         default="none",
-        choices=["none", "brainco"],
+        choices=["none", "brainco", "dex1"],
         help="End-effector driver for hand open/close (default: none). "
-        "'brainco' maps left/right Pico triggers to Brainco gripper open/close.",
+        "'brainco' maps left/right Pico triggers to Brainco gripper open/close; "
+        "'dex1' maps triggers to Dex1 gripper targets.",
     )
     parser.add_argument(
         "--dds-interface",

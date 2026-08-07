@@ -4,6 +4,8 @@ The ``gymnasium`` dependency is lazy-imported so the camera server can
 run without it.
 """
 
+from __future__ import annotations
+
 from abc import abstractmethod
 from typing import Any
 

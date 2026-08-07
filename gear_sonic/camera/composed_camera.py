@@ -17,6 +17,8 @@ Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 """
 
+from __future__ import annotations
+
 from collections import deque
 from dataclasses import dataclass
 import queue
@@ -173,16 +175,19 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 "device_id": self.config.head_device_id,
             }
 
-        if self.config.left_wrist_camera is not None:
-            camera_configs[CameraMountPosition.LEFT_WRIST.value] = {
-                "camera_type": self.config.left_wrist_camera,
-                "device_id": self.config.left_wrist_device_id,
-            }
-
+        # RealSense D405 on this robot: opening 260322276690 before 260322275012
+        # can leave the second camera with a started pipeline but no frames
+        # (USB bandwidth / hub quirk). Empirically, init right wrist first.
         if self.config.right_wrist_camera is not None:
             camera_configs[CameraMountPosition.RIGHT_WRIST.value] = {
                 "camera_type": self.config.right_wrist_camera,
                 "device_id": self.config.right_wrist_device_id,
+            }
+
+        if self.config.left_wrist_camera is not None:
+            camera_configs[CameraMountPosition.LEFT_WRIST.value] = {
+                "camera_type": self.config.left_wrist_camera,
+                "device_id": self.config.left_wrist_device_id,
             }
 
         return camera_configs
@@ -373,10 +378,37 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return OAKSensor(config=oak_config, mount_position=mount_position, device_id=device_id)
 
         elif camera_type == "realsense":
-            from gear_sonic.camera.drivers.realsense import RealSenseSensor
+            from gear_sonic.camera.drivers.realsense import RealSenseConfig, RealSenseSensor
 
             print(f"Initializing RealSense sensor for camera type: {camera_type}")
-            return RealSenseSensor(mount_position=mount_position)
+            # device_id 约定：
+            # - 短数字（0/1/...）当作设备索引
+            # - 长数字/字符串当作 RealSense serial（D405 序列号是纯数字，不能当 index）
+            # 与 image_server_dex1 一致：腕部默认只开 RGB，不开 depth。
+            rs_config = RealSenseConfig()
+            rs_config.enable_depth = False
+            serial_number = None
+            device_idx = 0
+            if device_id is not None:
+                device_id_str = str(device_id)
+                if device_id_str.isdigit() and len(device_id_str) <= 2:
+                    device_idx = int(device_id_str)
+                else:
+                    serial_number = device_id_str
+            # 与 image_server_dex1 一致：该右腕相机安装朝向需翻转 180°
+            if serial_number == "260322275012":
+                rs_config.rotate_180 = True
+                print("  RealSense rotate_180=True for serial 260322275012")
+            print(
+                f"  RealSense target: "
+                f"{'serial=' + serial_number if serial_number else 'index=' + str(device_idx)}"
+            )
+            return RealSenseSensor(
+                config=rs_config,
+                mount_position=mount_position,
+                id=device_idx,
+                serial_number=serial_number,
+            )
 
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor
